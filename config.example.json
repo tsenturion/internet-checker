@@ -1,0 +1,51 @@
+{
+  "check_interval_seconds": 5,
+  "request_timeout_seconds": 3,
+  "connectivity_success_confirmations": 1,
+  "connectivity_fail_confirmations": 2,
+  "country_confirmations": 1,
+  "notify_only_russia_transitions": true,
+  "russia_country_codes": [
+    "RU"
+  ],
+  "russia_country_names": [
+    "russia",
+    "Russia",
+    "RUSSIA",
+    "russian federation",
+    "россия",
+    "российская федерация"
+  ],
+  "notify_on_start": false,
+  "show_app_started_notification": true,
+  "app_started_title": "Internet Checker",
+  "app_started_message": "Application started. Monitoring is active.",
+  "toast_duration_seconds": 8,
+  "notification_cooldowns_seconds": {
+    "startup": 0,
+    "internet_status": 5,
+    "country_change": 0,
+    "public_ip_change": 2
+  },
+  "dedup_window_seconds": 30,
+  "single_instance_mutex_name": "Global\\InternetCheckerMutex",
+  "log_file_path": "logs/internet-checker.log",
+  "log_max_bytes": 1000000,
+  "log_backup_count": 5,
+  "log_to_console": true,
+  "connectivity_attempts": 2,
+  "connectivity_urls": [
+    "https://clients3.google.com/generate_204",
+    "https://www.msftconnecttest.com/connecttest.txt",
+    "https://cloudflare.com/cdn-cgi/trace"
+  ],
+  "country_lookup_urls": [
+    "https://ipapi.co/json/",
+    "http://ip-api.com/json/?fields=status,country,countryCode,query",
+    "https://ipwho.is/"
+  ],
+  "country_lookup_no_cache": true,
+  "notify_on_public_ip_change": true,
+  "tray_icon_tooltip": "Internet Checker",
+  "tray_exit_label": "Exit"
+}
