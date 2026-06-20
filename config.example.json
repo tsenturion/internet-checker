@@ -1,9 +1,12 @@
 {
   "check_interval_seconds": 5,
-  "request_timeout_seconds": 3,
+  "request_timeout_seconds": 1.5,
   "connectivity_success_confirmations": 1,
-  "connectivity_fail_confirmations": 2,
+  "connectivity_fail_confirmations": 1,
   "country_confirmations": 1,
+  "chatgpt_success_confirmations": 1,
+  "chatgpt_fail_confirmations": 1,
+  "notify_on_chatgpt_status_change": true,
   "notify_only_russia_transitions": true,
   "russia_country_codes": [
     "RU"
@@ -25,7 +28,8 @@
     "startup": 0,
     "internet_status": 5,
     "country_change": 0,
-    "public_ip_change": 2
+    "public_ip_change": 2,
+    "chatgpt_status": 5
   },
   "dedup_window_seconds": 30,
   "single_instance_mutex_name": "Global\\InternetCheckerMutex",
@@ -33,19 +37,32 @@
   "log_max_bytes": 1000000,
   "log_backup_count": 5,
   "log_to_console": true,
-  "connectivity_attempts": 2,
+  "connectivity_attempts": 1,
   "connectivity_urls": [
-    "https://clients3.google.com/generate_204",
-    "https://www.msftconnecttest.com/connecttest.txt",
-    "https://cloudflare.com/cdn-cgi/trace"
+    "http://www.msftconnecttest.com/connecttest.txt",
+    "https://cloudflare.com/cdn-cgi/trace",
+    "https://clients3.google.com/generate_204"
   ],
   "country_lookup_urls": [
-    "https://ipapi.co/json/",
+    "https://ipwho.is/",
     "http://ip-api.com/json/?fields=status,country,countryCode,query",
-    "https://ipwho.is/"
+    "https://ipapi.co/json/"
+  ],
+  "chatgpt_probe_urls": [
+    {
+      "url": "https://chatgpt.com/",
+      "method": "TCP"
+    },
+    {
+      "url": "https://api.openai.com/v1/models",
+      "method": "TCP"
+    }
   ],
   "country_lookup_no_cache": true,
   "notify_on_public_ip_change": true,
   "tray_icon_tooltip": "Internet Checker",
-  "tray_exit_label": "Exit"
+  "tray_show_status_label": "Показать статус",
+  "tray_check_now_label": "Проверить сейчас",
+  "tray_open_log_label": "Открыть лог",
+  "tray_exit_label": "Выход"
 }

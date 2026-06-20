@@ -1,9 +1,13 @@
 import argparse
+import concurrent.futures
 import copy
 import ctypes
+from ctypes import wintypes
 import json
 import logging
 import os
+import socket
+import ssl
 import sys
 import threading
 import time
@@ -12,19 +16,27 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 from PIL import Image, ImageDraw
 from pystray import Icon, Menu, MenuItem
+try:
+    from pystray._util import win32 as pystray_win32
+except Exception:
+    pystray_win32 = None
 from windows_toasts import Toast, ToastDuration, WindowsToaster
 
 
 DEFAULT_CONFIG = {
     "check_interval_seconds": 5,
-    "request_timeout_seconds": 3,
+    "request_timeout_seconds": 1.5,
     "connectivity_success_confirmations": 1,
-    "connectivity_fail_confirmations": 2,
+    "connectivity_fail_confirmations": 1,
     "country_confirmations": 1,
+    "chatgpt_success_confirmations": 1,
+    "chatgpt_fail_confirmations": 1,
+    "notify_on_chatgpt_status_change": True,
     "notify_only_russia_transitions": True,
     "russia_country_codes": ["RU"],
     "russia_country_names": [
@@ -45,6 +57,7 @@ DEFAULT_CONFIG = {
         "internet_status": 5,
         "country_change": 0,
         "public_ip_change": 2,
+        "chatgpt_status": 5,
     },
     "dedup_window_seconds": 30,
     "single_instance_mutex_name": "Global\\InternetCheckerMutex",
@@ -52,21 +65,28 @@ DEFAULT_CONFIG = {
     "log_max_bytes": 1_000_000,
     "log_backup_count": 5,
     "log_to_console": True,
-    "connectivity_attempts": 2,
+    "connectivity_attempts": 1,
     "connectivity_urls": [
-        "https://clients3.google.com/generate_204",
-        "https://www.msftconnecttest.com/connecttest.txt",
+        "http://www.msftconnecttest.com/connecttest.txt",
         "https://cloudflare.com/cdn-cgi/trace",
+        "https://clients3.google.com/generate_204",
     ],
     "country_lookup_urls": [
-        "https://ipapi.co/json/",
-        "http://ip-api.com/json/?fields=status,country,countryCode,query",
         "https://ipwho.is/",
+        "http://ip-api.com/json/?fields=status,country,countryCode,query",
+        "https://ipapi.co/json/",
+    ],
+    "chatgpt_probe_urls": [
+        {"url": "https://chatgpt.com/", "method": "TCP"},
+        {"url": "https://api.openai.com/v1/models", "method": "TCP"},
     ],
     "country_lookup_no_cache": True,
     "notify_on_public_ip_change": True,
     "tray_icon_tooltip": "Internet Checker",
-    "tray_exit_label": "Exit",
+    "tray_show_status_label": "Показать статус",
+    "tray_check_now_label": "Проверить сейчас",
+    "tray_open_log_label": "Открыть лог",
+    "tray_exit_label": "Выход",
 }
 
 
@@ -76,6 +96,7 @@ class NetworkState:
     country_name: Optional[str]
     country_code: Optional[str]
     public_ip: Optional[str]
+    chatgpt_online: Optional[bool]
     checked_at: datetime
 
 
@@ -90,6 +111,15 @@ class NotificationEvent:
 class DebounceUpdate:
     online_changed: bool
     country_changed: bool
+    chatgpt_changed: bool
+
+
+@dataclass(frozen=True)
+class StatusSnapshot:
+    state: Optional[NetworkState]
+    checking: bool
+    updated_at: Optional[datetime]
+    last_error: Optional[str]
 
 
 class SingleInstance:
@@ -129,18 +159,30 @@ class SingleInstance:
 
 
 class StateDebouncer:
-    def __init__(self, online_success: int, online_fail: int, country_confirmations: int):
+    def __init__(
+        self,
+        online_success: int,
+        online_fail: int,
+        country_confirmations: int,
+        chatgpt_success: int,
+        chatgpt_fail: int,
+    ):
         self._online_success_required = max(1, int(online_success))
         self._online_fail_required = max(1, int(online_fail))
         self._country_required = max(1, int(country_confirmations))
+        self._chatgpt_success_required = max(1, int(chatgpt_success))
+        self._chatgpt_fail_required = max(1, int(chatgpt_fail))
 
         self._stable_online: Optional[bool] = None
         self._stable_country_name: Optional[str] = None
         self._stable_country_code: Optional[str] = None
         self._stable_public_ip: Optional[str] = None
+        self._stable_chatgpt_online: Optional[bool] = None
 
         self._online_success_streak = 0
         self._online_fail_streak = 0
+        self._chatgpt_success_streak = 0
+        self._chatgpt_fail_streak = 0
 
         self._country_candidate_key: Optional[str] = None
         self._country_candidate_name: Optional[str] = None
@@ -166,6 +208,14 @@ class StateDebouncer:
     @property
     def stable_public_ip(self) -> Optional[str]:
         return self._stable_public_ip
+
+    @property
+    def stable_chatgpt_online(self) -> Optional[bool]:
+        return self._stable_chatgpt_online
+
+    @property
+    def has_stable_chatgpt(self) -> bool:
+        return self._stable_chatgpt_online is not None
 
     @staticmethod
     def _country_key(country_name: Optional[str], country_code: Optional[str]) -> Optional[str]:
@@ -204,18 +254,53 @@ class StateDebouncer:
         self._country_candidate_code = None
         self._country_candidate_streak = 0
 
+    def _update_chatgpt(self, raw_chatgpt_online: bool) -> bool:
+        if raw_chatgpt_online:
+            self._chatgpt_success_streak += 1
+            self._chatgpt_fail_streak = 0
+        else:
+            self._chatgpt_fail_streak += 1
+            self._chatgpt_success_streak = 0
+
+        if self._stable_chatgpt_online is None:
+            if raw_chatgpt_online and self._chatgpt_success_streak >= self._chatgpt_success_required:
+                self._stable_chatgpt_online = True
+            elif not raw_chatgpt_online and self._chatgpt_fail_streak >= self._chatgpt_fail_required:
+                self._stable_chatgpt_online = False
+            return False
+
+        if (
+            self._stable_chatgpt_online
+            and not raw_chatgpt_online
+            and self._chatgpt_fail_streak >= self._chatgpt_fail_required
+        ):
+            self._stable_chatgpt_online = False
+            return True
+
+        if (
+            not self._stable_chatgpt_online
+            and raw_chatgpt_online
+            and self._chatgpt_success_streak >= self._chatgpt_success_required
+        ):
+            self._stable_chatgpt_online = True
+            return True
+
+        return False
+
     def update(
         self,
         raw_online: bool,
         raw_country_name: Optional[str],
         raw_country_code: Optional[str],
         raw_public_ip: Optional[str],
+        raw_chatgpt_online: bool,
     ) -> DebounceUpdate:
         raw_country_name, raw_country_code = self._normalize_country(raw_country_name, raw_country_code)
         raw_public_ip = self._normalize_public_ip(raw_public_ip)
 
         online_changed = False
         country_changed = False
+        chatgpt_changed = self._update_chatgpt(raw_chatgpt_online)
 
         if raw_online:
             self._online_success_streak += 1
@@ -230,7 +315,11 @@ class StateDebouncer:
             elif not raw_online and self._online_fail_streak >= self._online_fail_required:
                 self._stable_online = False
             else:
-                return DebounceUpdate(online_changed=False, country_changed=False)
+                return DebounceUpdate(
+                    online_changed=False,
+                    country_changed=False,
+                    chatgpt_changed=chatgpt_changed,
+                )
         elif self._stable_online and not raw_online and self._online_fail_streak >= self._online_fail_required:
             self._stable_online = False
             online_changed = True
@@ -243,7 +332,11 @@ class StateDebouncer:
             self._stable_country_code = None
             self._stable_public_ip = None
             self._reset_country_candidate()
-            return DebounceUpdate(online_changed=online_changed, country_changed=False)
+            return DebounceUpdate(
+                online_changed=online_changed,
+                country_changed=False,
+                chatgpt_changed=chatgpt_changed,
+            )
 
         if raw_public_ip:
             self._stable_public_ip = raw_public_ip
@@ -253,13 +346,21 @@ class StateDebouncer:
 
         if raw_key is None:
             self._reset_country_candidate()
-            return DebounceUpdate(online_changed=online_changed, country_changed=False)
+            return DebounceUpdate(
+                online_changed=online_changed,
+                country_changed=False,
+                chatgpt_changed=chatgpt_changed,
+            )
 
         if stable_key is None:
             self._stable_country_name = raw_country_name
             self._stable_country_code = raw_country_code
             self._reset_country_candidate()
-            return DebounceUpdate(online_changed=online_changed, country_changed=False)
+            return DebounceUpdate(
+                online_changed=online_changed,
+                country_changed=False,
+                chatgpt_changed=chatgpt_changed,
+            )
 
         if raw_key == stable_key:
             if raw_country_name and raw_country_name != self._stable_country_name:
@@ -267,7 +368,11 @@ class StateDebouncer:
             if raw_country_code and raw_country_code != self._stable_country_code:
                 self._stable_country_code = raw_country_code
             self._reset_country_candidate()
-            return DebounceUpdate(online_changed=online_changed, country_changed=False)
+            return DebounceUpdate(
+                online_changed=online_changed,
+                country_changed=False,
+                chatgpt_changed=chatgpt_changed,
+            )
 
         if raw_key == self._country_candidate_key:
             self._country_candidate_streak += 1
@@ -283,7 +388,11 @@ class StateDebouncer:
             self._reset_country_candidate()
             country_changed = True
 
-        return DebounceUpdate(online_changed=online_changed, country_changed=country_changed)
+        return DebounceUpdate(
+            online_changed=online_changed,
+            country_changed=country_changed,
+            chatgpt_changed=chatgpt_changed,
+        )
 
 
 class NotificationPolicy:
@@ -319,6 +428,72 @@ class NotificationPolicy:
             self._last_by_fingerprint[event.fingerprint] = now_ts
             self._cleanup(now_ts)
         return True, None
+
+
+class StatusStore:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state: Optional[NetworkState] = None
+        self._checking = False
+        self._updated_at: Optional[datetime] = None
+        self._last_error: Optional[str] = None
+
+    def set_checking(self, checking: bool) -> None:
+        with self._lock:
+            self._checking = checking
+            if checking:
+                self._last_error = None
+
+    def set_state(self, state: NetworkState) -> None:
+        with self._lock:
+            self._state = state
+            self._checking = False
+            self._updated_at = state.checked_at
+            self._last_error = None
+
+    def set_error(self, message: str) -> None:
+        with self._lock:
+            self._checking = False
+            self._last_error = message
+            self._updated_at = datetime.now()
+
+    def snapshot(self) -> StatusSnapshot:
+        with self._lock:
+            return StatusSnapshot(
+                state=self._state,
+                checking=self._checking,
+                updated_at=self._updated_at,
+                last_error=self._last_error,
+            )
+
+
+def normalize_probe_urls(value: object, default: list[dict[str, str]], default_method: str) -> list[dict[str, str]]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        value = []
+
+    probes: list[dict[str, str]] = []
+    for item in value:
+        if isinstance(item, str):
+            url = item.strip()
+            method = default_method
+        elif isinstance(item, dict):
+            raw_url = item.get("url")
+            url = raw_url.strip() if isinstance(raw_url, str) else ""
+            raw_method = item.get("method", default_method)
+            method = raw_method.strip().upper() if isinstance(raw_method, str) else default_method
+        else:
+            continue
+
+        if not url:
+            continue
+        if method not in {"GET", "HEAD", "TCP"}:
+            method = default_method
+
+        probes.append({"url": url, "method": method})
+
+    return probes or copy.deepcopy(default)
 
 
 def load_config(path: Path) -> dict:
@@ -369,18 +544,34 @@ def load_config(path: Path) -> dict:
         if isinstance(item, str) and item.strip()
     ]
     config["connectivity_urls"] = clean_connectivity_urls or list(DEFAULT_CONFIG["connectivity_urls"])
+    config["chatgpt_probe_urls"] = normalize_probe_urls(
+        config.get("chatgpt_probe_urls"),
+        default=DEFAULT_CONFIG["chatgpt_probe_urls"],
+        default_method="HEAD",
+    )
 
     config["check_interval_seconds"] = max(1, int(config["check_interval_seconds"]))
-    config["request_timeout_seconds"] = max(1, int(config["request_timeout_seconds"]))
+    config["request_timeout_seconds"] = max(0.2, float(config["request_timeout_seconds"]))
     config["connectivity_attempts"] = max(1, int(config.get("connectivity_attempts", 1)))
     config["connectivity_success_confirmations"] = max(1, int(config["connectivity_success_confirmations"]))
     config["connectivity_fail_confirmations"] = max(1, int(config["connectivity_fail_confirmations"]))
     config["country_confirmations"] = max(1, int(config["country_confirmations"]))
+    config["chatgpt_success_confirmations"] = max(1, int(config["chatgpt_success_confirmations"]))
+    config["chatgpt_fail_confirmations"] = max(1, int(config["chatgpt_fail_confirmations"]))
     config["dedup_window_seconds"] = max(0, int(config["dedup_window_seconds"]))
     config["log_max_bytes"] = max(1024, int(config["log_max_bytes"]))
     config["log_backup_count"] = max(1, int(config["log_backup_count"]))
     config["toast_duration_seconds"] = max(1, int(config["toast_duration_seconds"]))
     config["tray_icon_tooltip"] = str(config.get("tray_icon_tooltip", "Internet Checker")).strip() or "Internet Checker"
+    config["tray_show_status_label"] = (
+        str(config.get("tray_show_status_label", "Показать статус")).strip() or "Показать статус"
+    )
+    config["tray_check_now_label"] = (
+        str(config.get("tray_check_now_label", "Проверить сейчас")).strip() or "Проверить сейчас"
+    )
+    config["tray_open_log_label"] = (
+        str(config.get("tray_open_log_label", "Открыть лог")).strip() or "Открыть лог"
+    )
     config["tray_exit_label"] = str(config.get("tray_exit_label", "Exit")).strip() or "Exit"
     config["app_started_title"] = str(config.get("app_started_title", "Internet Checker")).strip() or "Internet Checker"
     config["app_started_message"] = (
@@ -411,6 +602,7 @@ def load_config(path: Path) -> dict:
 
     config["country_lookup_no_cache"] = bool(config.get("country_lookup_no_cache", True))
     config["notify_on_public_ip_change"] = bool(config.get("notify_on_public_ip_change", True))
+    config["notify_on_chatgpt_status_change"] = bool(config.get("notify_on_chatgpt_status_change", True))
 
     return config
 
@@ -526,22 +718,89 @@ def setup_logging(config: dict) -> logging.Logger:
     return logger
 
 
-def check_connectivity(
-    session: requests.Session,
-    urls: list[str],
-    timeout_seconds: int,
-    attempts: int,
-) -> bool:
-    for attempt_index in range(max(1, attempts)):
-        for url in urls:
+def build_request_timeout(timeout_seconds: float) -> tuple[float, float]:
+    timeout = max(0.2, float(timeout_seconds))
+    return min(0.75, timeout), timeout
+
+
+def tcp_probe_url(url: str, timeout_seconds: float) -> tuple[bool, str]:
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        return False, f"TCP {url} -> invalid URL"
+
+    scheme = parsed.scheme.lower()
+    port = parsed.port or (443 if scheme == "https" else 80)
+    use_tls = scheme == "https"
+    timeout = max(0.2, float(timeout_seconds))
+
+    raw_socket = None
+    try:
+        raw_socket = socket.create_connection((host, port), timeout=timeout)
+        if use_tls:
+            context = ssl.create_default_context()
+            with context.wrap_socket(raw_socket, server_hostname=host):
+                raw_socket = None
+                return True, f"TCP {host}:{port} TLS -> connected"
+        raw_socket.close()
+        raw_socket = None
+        return True, f"TCP {host}:{port} -> connected"
+    except OSError as exc:
+        return False, f"TCP {host}:{port} -> {type(exc).__name__}"
+    finally:
+        if raw_socket is not None:
             try:
-                response = session.get(url, timeout=timeout_seconds)
-                if response.status_code < 500:
-                    return True
-            except requests.RequestException:
+                raw_socket.close()
+            except OSError:
                 pass
+
+
+def http_probe(url: str, timeout_seconds: float, method: str = "HEAD") -> tuple[bool, str]:
+    method = method.upper()
+    if method == "TCP":
+        return tcp_probe_url(url, timeout_seconds)
+
+    try:
+        response = requests.request(
+            method=method,
+            url=url,
+            timeout=build_request_timeout(timeout_seconds),
+            allow_redirects=True,
+            headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+        )
+        return response.status_code < 500, f"{method} {url} -> HTTP {response.status_code}"
+    except requests.RequestException as exc:
+        tcp_ok, tcp_detail = tcp_probe_url(url, timeout_seconds)
+        if tcp_ok:
+            return True, tcp_detail
+        return False, f"{method} {url} -> {type(exc).__name__}; {tcp_detail}"
+
+
+def check_connectivity(urls: list[str], timeout_seconds: float, attempts: int) -> bool:
+    urls = [url for url in urls if isinstance(url, str) and url.strip()]
+    if not urls:
+        return False
+
+    for attempt_index in range(max(1, attempts)):
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(len(urls), 6),
+            thread_name_prefix="connectivity-probe",
+        )
+        futures = [executor.submit(http_probe, url, timeout_seconds, "TCP") for url in urls]
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=float(timeout_seconds) + 0.5):
+                ok, _detail = future.result()
+                if ok:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    return True
+        except concurrent.futures.TimeoutError:
+            pass
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
         if attempt_index < attempts - 1:
-            time.sleep(0.2)
+            time.sleep(0.1)
+
     return False
 
 
@@ -604,39 +863,109 @@ def build_country_request_url(url: str, no_cache: bool) -> str:
     return f"{url}{separator}_ts={int(time.time() * 1000)}"
 
 
+def fetch_country_from_url(
+    url: str,
+    timeout_seconds: float,
+    no_cache: bool,
+) -> tuple[Optional[str], Optional[str], Optional[str], str, Optional[str]]:
+    headers = {"User-Agent": "InternetChecker/1.0"}
+    if no_cache:
+        headers.update({"Cache-Control": "no-cache", "Pragma": "no-cache"})
+    request_url = build_country_request_url(url, no_cache=no_cache)
+    try:
+        response = requests.get(
+            request_url,
+            timeout=max(0.2, float(timeout_seconds)),
+            headers=headers,
+        )
+        response.raise_for_status()
+        country_name, country_code, public_ip = parse_country_payload(response.json())
+        if country_name or country_code or public_ip:
+            return country_name, country_code, public_ip, url, None
+        return None, None, None, url, "empty response"
+    except (requests.RequestException, ValueError) as exc:
+        return None, None, None, url, type(exc).__name__
+
+
 def fetch_country(
-    session: requests.Session,
     urls: list[str],
-    timeout_seconds: int,
+    timeout_seconds: float,
     logger: logging.Logger,
     no_cache: bool,
 ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    errors: list[str] = []
-    headers = {"Cache-Control": "no-cache", "Pragma": "no-cache"} if no_cache else None
+    urls = [url for url in urls if isinstance(url, str) and url.strip()]
+    if not urls:
+        return None, None, None, None
 
-    for url in urls:
-        request_url = build_country_request_url(url, no_cache=no_cache)
-        try:
-            response = session.get(request_url, timeout=timeout_seconds, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            country_name, country_code, public_ip = parse_country_payload(data)
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(len(urls), 6),
+        thread_name_prefix="country-probe",
+    )
+    futures = [
+        executor.submit(fetch_country_from_url, url, timeout_seconds, no_cache)
+        for url in urls
+    ]
+    errors: list[str] = []
+
+    try:
+        for future in concurrent.futures.as_completed(futures, timeout=float(timeout_seconds) + 0.75):
+            country_name, country_code, public_ip, source_url, error = future.result()
             if country_name or country_code or public_ip:
-                return country_name, country_code, public_ip, url
-        except (requests.RequestException, ValueError) as exc:
-            errors.append(f"{url} ({type(exc).__name__})")
+                executor.shutdown(wait=False, cancel_futures=True)
+                return country_name, country_code, public_ip, source_url
+            if error:
+                errors.append(f"{source_url} ({error})")
+    except concurrent.futures.TimeoutError:
+        errors.append("timeout")
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     if errors:
         logger.info("Country lookup failed on all APIs: %s", "; ".join(errors))
     return None, None, None, None
 
 
+def check_chatgpt(probes: list[dict[str, str]], timeout_seconds: float) -> bool:
+    if not probes:
+        return False
+
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(len(probes), 4),
+        thread_name_prefix="chatgpt-probe",
+    )
+    futures = [
+        executor.submit(http_probe, probe["url"], timeout_seconds, probe.get("method", "HEAD"))
+        for probe in probes
+        if probe.get("url")
+    ]
+
+    try:
+        for future in concurrent.futures.as_completed(futures, timeout=float(timeout_seconds) + 0.5):
+            ok, _detail = future.result()
+            if ok:
+                executor.shutdown(wait=False, cancel_futures=True)
+                return True
+    except concurrent.futures.TimeoutError:
+        pass
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    return False
+
+
 def snapshot_text(state: NetworkState) -> str:
     if not state.online:
-        return "Internet: OFFLINE"
+        return f"Internet: OFFLINE | ChatGPT: {format_chatgpt_status(state.chatgpt_online)}"
     country = state.country_name or state.country_code or "Unknown"
+    chatgpt = format_chatgpt_status(state.chatgpt_online)
     ip_suffix = f" | IP: {state.public_ip}" if state.public_ip else ""
-    return f"Internet: ONLINE | Country: {country}{ip_suffix}"
+    return f"Internet: ONLINE | Country: {country} | ChatGPT: {chatgpt}{ip_suffix}"
+
+
+def format_chatgpt_status(value: Optional[bool]) -> str:
+    if value is None:
+        return "UNKNOWN"
+    return "ONLINE" if value else "OFFLINE"
 
 
 def is_russia_country(
@@ -667,6 +996,7 @@ def collect_events(
     notify_on_start: bool,
     notify_only_russia_transitions: bool,
     notify_on_public_ip_change: bool,
+    notify_on_chatgpt_status_change: bool,
     russia_codes: set[str],
     russia_names: set[str],
 ) -> list[NotificationEvent]:
@@ -684,17 +1014,31 @@ def collect_events(
 
     events: list[NotificationEvent] = []
 
-    if prev.online != current.online:
-        if notify_only_russia_transitions:
-            return events
-        status = "ONLINE" if current.online else "OFFLINE"
+    if (
+        notify_on_chatgpt_status_change
+        and prev.chatgpt_online is not None
+        and current.chatgpt_online is not None
+        and prev.chatgpt_online != current.chatgpt_online
+    ):
+        status = format_chatgpt_status(current.chatgpt_online)
         events.append(
             NotificationEvent(
-                event_type="internet_status",
-                message=f"Internet status changed: {status}\n{snapshot_text(current)}",
-                fingerprint=f"internet_status:{status}",
+                event_type="chatgpt_status",
+                message=f"ChatGPT connection changed: {status}",
+                fingerprint=f"chatgpt_status:{status}",
             )
         )
+
+    if prev.online != current.online:
+        if not notify_only_russia_transitions:
+            status = "ONLINE" if current.online else "OFFLINE"
+            events.append(
+                NotificationEvent(
+                    event_type="internet_status",
+                    message=f"Internet status changed: {status}\n{snapshot_text(current)}",
+                    fingerprint=f"internet_status:{status}",
+                )
+            )
         return events
 
     prev_country_key = prev.country_code or prev.country_name
@@ -756,13 +1100,140 @@ def create_tray_image() -> Image.Image:
     return image
 
 
-def run_monitor_loop(config: dict, logger: logging.Logger, stop_event: threading.Event, run_once: bool) -> None:
-    session = requests.Session()
+class ClickMenuIcon(Icon):
+    def _show_click_menu(self) -> bool:
+        if pystray_win32 is None or not self._menu_handle:
+            return False
+
+        self.update_menu()
+        pystray_win32.SetForegroundWindow(self._hwnd)
+
+        point = wintypes.POINT()
+        pystray_win32.GetCursorPos(ctypes.byref(point))
+
+        hmenu, descriptors = self._menu_handle
+        index = pystray_win32.TrackPopupMenuEx(
+            hmenu,
+            pystray_win32.TPM_RIGHTALIGN | pystray_win32.TPM_BOTTOMALIGN | pystray_win32.TPM_RETURNCMD,
+            point.x,
+            point.y,
+            self._menu_hwnd,
+            None,
+        )
+        if index > 0:
+            descriptors[index - 1](self)
+        return True
+
+    def _on_notify(self, wparam, lparam):
+        if pystray_win32 is not None and lparam in {pystray_win32.WM_LBUTTONUP, pystray_win32.WM_RBUTTONUP}:
+            if self._show_click_menu():
+                return
+        return super()._on_notify(wparam, lparam)
+
+
+def tray_status_lines(snapshot: StatusSnapshot) -> list[str]:
+    if snapshot.last_error:
+        return [f"Ошибка: {snapshot.last_error}"]
+
+    if snapshot.state is None:
+        return ["Статус: проверяется..." if snapshot.checking else "Статус: нет данных"]
+
+    state = snapshot.state
+    internet = "ONLINE" if state.online else "OFFLINE"
+    country = state.country_name or state.country_code or "Unknown"
+    checked_at = state.checked_at.strftime("%H:%M:%S")
+    lines = [
+        f"Интернет: {internet}",
+        f"Страна: {country}",
+        f"ChatGPT: {format_chatgpt_status(state.chatgpt_online)}",
+    ]
+    if state.public_ip:
+        lines.append(f"IP: {state.public_ip}")
+    lines.append(f"Обновлено: {checked_at}")
+    if snapshot.checking:
+        lines.append("Проверка: выполняется")
+    return lines
+
+
+def tray_tooltip(base_title: str, snapshot: StatusSnapshot) -> str:
+    if snapshot.state is None:
+        return f"{base_title} - checking" if snapshot.checking else base_title
+    state = snapshot.state
+    internet = "ONLINE" if state.online else "OFFLINE"
+    chatgpt = format_chatgpt_status(state.chatgpt_online)
+    country = state.country_name or state.country_code or "Unknown"
+    return f"{base_title} - Internet {internet}, ChatGPT {chatgpt}, {country}"
+
+
+def make_tray_menu(
+    config: dict,
+    logger: logging.Logger,
+    status_store: StatusStore,
+    check_now_event: threading.Event,
+    stop_event: threading.Event,
+) -> Menu:
+    def items():
+        snapshot = status_store.snapshot()
+        for line in tray_status_lines(snapshot):
+            yield MenuItem(line, None, enabled=False)
+        yield Menu.SEPARATOR
+        yield MenuItem(
+            str(config["tray_show_status_label"]),
+            lambda icon, item: _on_tray_show_status(icon, logger, status_store),
+        )
+        yield MenuItem(
+            str(config["tray_check_now_label"]),
+            lambda icon, item: _on_tray_check_now(icon, logger, status_store, check_now_event),
+        )
+        yield MenuItem(
+            str(config["tray_open_log_label"]),
+            lambda icon, item: _on_tray_open_log(logger, Path(str(config["log_file_path"]))),
+        )
+        yield Menu.SEPARATOR
+        yield MenuItem(
+            str(config["tray_exit_label"]),
+            lambda icon, item: _on_tray_exit(icon, logger, stop_event),
+        )
+
+    return Menu(items)
+
+
+def wait_for_next_cycle(
+    stop_event: threading.Event,
+    check_now_event: Optional[threading.Event],
+    interval_seconds: int,
+) -> None:
+    deadline = time.monotonic() + max(1, int(interval_seconds))
+    while not stop_event.is_set() and time.monotonic() < deadline:
+        if check_now_event is not None and check_now_event.is_set():
+            check_now_event.clear()
+            return
+        time.sleep(0.1)
+
+
+def future_result(future: concurrent.futures.Future, default: object, logger: logging.Logger, label: str) -> object:
+    try:
+        return future.result()
+    except Exception as exc:
+        logger.info("%s failed: %s", label, exc)
+        return default
+
+
+def run_monitor_loop(
+    config: dict,
+    logger: logging.Logger,
+    stop_event: threading.Event,
+    run_once: bool,
+    status_store: StatusStore,
+    check_now_event: Optional[threading.Event],
+) -> None:
     toaster = WindowsToaster("Internet Checker")
     debouncer = StateDebouncer(
         online_success=int(config["connectivity_success_confirmations"]),
         online_fail=int(config["connectivity_fail_confirmations"]),
         country_confirmations=int(config["country_confirmations"]),
+        chatgpt_success=int(config["chatgpt_success_confirmations"]),
+        chatgpt_fail=int(config["chatgpt_fail_confirmations"]),
     )
     notification_policy = NotificationPolicy(
         cooldowns=config["notification_cooldowns_seconds"],
@@ -789,37 +1260,64 @@ def run_monitor_loop(config: dict, logger: logging.Logger, stop_event: threading
         while not stop_event.is_set():
             now = datetime.now()
             now_ts = time.time()
-            timeout = int(config["request_timeout_seconds"])
+            timeout = float(config["request_timeout_seconds"])
+            if check_now_event is not None:
+                check_now_event.clear()
+            status_store.set_checking(True)
 
-            raw_online = check_connectivity(
-                session=session,
-                urls=config["connectivity_urls"],
-                timeout_seconds=timeout,
-                attempts=int(config["connectivity_attempts"]),
-            )
-            raw_country_name, raw_country_code, raw_public_ip, country_source = (None, None, None, None)
-            if raw_online:
-                country_urls = list(config["country_lookup_urls"])
-                if last_country_source and last_country_source in country_urls:
-                    country_urls = [last_country_source] + [url for url in country_urls if url != last_country_source]
+            country_urls = list(config["country_lookup_urls"])
+            if last_country_source and last_country_source in country_urls:
+                country_urls = [last_country_source] + [url for url in country_urls if url != last_country_source]
 
-                raw_country_name, raw_country_code, raw_public_ip, country_source = fetch_country(
-                    session=session,
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="monitor-cycle") as executor:
+                online_future = executor.submit(
+                    check_connectivity,
+                    urls=config["connectivity_urls"],
+                    timeout_seconds=timeout,
+                    attempts=int(config["connectivity_attempts"]),
+                )
+                country_future = executor.submit(
+                    fetch_country,
                     urls=country_urls,
                     timeout_seconds=timeout,
                     logger=logger,
                     no_cache=bool(config.get("country_lookup_no_cache", True)),
                 )
-                if country_source and country_source != last_country_source:
-                    logger.info("Country API source selected: %s", country_source)
-                    last_country_source = country_source
+                chatgpt_future = executor.submit(
+                    check_chatgpt,
+                    probes=config["chatgpt_probe_urls"],
+                    timeout_seconds=timeout,
+                )
 
-            debouncer.update(raw_online, raw_country_name, raw_country_code, raw_public_ip)
+                raw_country_name, raw_country_code, raw_public_ip, country_source = future_result(
+                    country_future,
+                    (None, None, None, None),
+                    logger,
+                    "Country lookup",
+                )
+                raw_chatgpt_online = bool(future_result(chatgpt_future, False, logger, "ChatGPT check"))
+                raw_connectivity_online = bool(future_result(online_future, False, logger, "Connectivity check"))
+
+            if country_source and country_source != last_country_source:
+                logger.info("Country API source selected: %s", country_source)
+                last_country_source = country_source
+
+            raw_online = raw_connectivity_online or raw_chatgpt_online or bool(
+                raw_country_name or raw_country_code or raw_public_ip
+            )
+
+            debouncer.update(
+                raw_online,
+                raw_country_name,
+                raw_country_code,
+                raw_public_ip,
+                raw_chatgpt_online,
+            )
             if not debouncer.has_stable_online:
                 logger.info("No notification. State: warming up connectivity checks.")
                 if run_once:
                     break
-                stop_event.wait(int(config["check_interval_seconds"]))
+                wait_for_next_cycle(stop_event, check_now_event, int(config["check_interval_seconds"]))
                 continue
 
             current_state = NetworkState(
@@ -827,8 +1325,10 @@ def run_monitor_loop(config: dict, logger: logging.Logger, stop_event: threading
                 country_name=debouncer.stable_country_name if debouncer.stable_online else None,
                 country_code=debouncer.stable_country_code if debouncer.stable_online else None,
                 public_ip=debouncer.stable_public_ip if debouncer.stable_online else None,
+                chatgpt_online=debouncer.stable_chatgpt_online if debouncer.has_stable_chatgpt else None,
                 checked_at=now,
             )
+            status_store.set_state(current_state)
 
             candidate_events = collect_events(
                 prev=previous_state,
@@ -836,6 +1336,7 @@ def run_monitor_loop(config: dict, logger: logging.Logger, stop_event: threading
                 notify_on_start=bool(config["notify_on_start"]),
                 notify_only_russia_transitions=bool(config["notify_only_russia_transitions"]),
                 notify_on_public_ip_change=bool(config.get("notify_on_public_ip_change", True)),
+                notify_on_chatgpt_status_change=bool(config.get("notify_on_chatgpt_status_change", True)),
                 russia_codes=set(config["russia_country_codes"]),
                 russia_names=set(config["russia_country_names"]),
             )
@@ -871,11 +1372,11 @@ def run_monitor_loop(config: dict, logger: logging.Logger, stop_event: threading
             previous_state = current_state
             if run_once:
                 break
-            stop_event.wait(int(config["check_interval_seconds"]))
-    except Exception:
+            wait_for_next_cycle(stop_event, check_now_event, int(config["check_interval_seconds"]))
+    except Exception as exc:
+        status_store.set_error(type(exc).__name__)
         logger.exception("Fatal error in monitor loop.")
     finally:
-        session.close()
         logger.info("Internet checker stopped.")
         stop_event.set()
 
@@ -885,17 +1386,19 @@ def run_with_tray(
     logger: logging.Logger,
     stop_event: threading.Event,
     monitor_thread: threading.Thread,
+    status_store: StatusStore,
+    check_now_event: threading.Event,
 ) -> None:
-    tray_icon = Icon(
+    tray_icon = ClickMenuIcon(
         name="internet-checker",
         icon=create_tray_image(),
-        title=str(config["tray_icon_tooltip"]),
-        menu=Menu(
-            MenuItem(
-                str(config["tray_exit_label"]),
-                lambda icon, item: _on_tray_exit(icon, logger, stop_event),
-                default=True,
-            )
+        title=tray_tooltip(str(config["tray_icon_tooltip"]), status_store.snapshot()),
+        menu=make_tray_menu(
+            config=config,
+            logger=logger,
+            status_store=status_store,
+            check_now_event=check_now_event,
+            stop_event=stop_event,
         ),
     )
 
@@ -907,12 +1410,65 @@ def run_with_tray(
             except Exception:
                 pass
 
+    def refresh_tooltip() -> None:
+        while not stop_event.is_set():
+            try:
+                tray_icon.title = tray_tooltip(str(config["tray_icon_tooltip"]), status_store.snapshot())
+            except Exception:
+                pass
+            time.sleep(1)
+
     watcher = threading.Thread(target=watch_monitor, name="tray-monitor-watcher", daemon=True)
     watcher.start()
+    refresher = threading.Thread(target=refresh_tooltip, name="tray-tooltip-refresher", daemon=True)
+    refresher.start()
 
     tray_icon.run()
     stop_event.set()
     monitor_thread.join()
+
+
+def _on_tray_show_status(icon: Icon, logger: logging.Logger, status_store: StatusStore) -> None:
+    snapshot = status_store.snapshot()
+    if snapshot.state is not None:
+        message = snapshot_text(snapshot.state)
+    elif snapshot.last_error:
+        message = f"Error: {snapshot.last_error}"
+    elif snapshot.checking:
+        message = "Checking..."
+    else:
+        message = "No data yet."
+
+    try:
+        icon.notify(message, "Internet Checker")
+    except Exception as exc:
+        logger.info("Tray status notification failed: %s", exc)
+
+
+def _on_tray_check_now(
+    icon: Icon,
+    logger: logging.Logger,
+    status_store: StatusStore,
+    check_now_event: threading.Event,
+) -> None:
+    logger.info("Manual check requested from tray.")
+    status_store.set_checking(True)
+    check_now_event.set()
+    try:
+        icon.update_menu()
+        icon.title = "Internet Checker - checking"
+    except Exception:
+        pass
+
+
+def _on_tray_open_log(logger: logging.Logger, log_path: Path) -> None:
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if not log_path.exists():
+            log_path.touch()
+        os.startfile(str(log_path))
+    except Exception as exc:
+        logger.info("Opening log file failed: %s", exc)
 
 
 def _on_tray_exit(icon: Icon, logger: logging.Logger, stop_event: threading.Event) -> None:
@@ -972,6 +1528,8 @@ def main() -> None:
         return
 
     stop_event = threading.Event()
+    check_now_event = threading.Event()
+    status_store = StatusStore()
     logger: Optional[logging.Logger] = None
 
     try:
@@ -985,7 +1543,14 @@ def main() -> None:
             logger.info("Config file not found (%s). Using defaults.", config_path.resolve())
 
         if args.once or args.no_tray:
-            run_monitor_loop(config=config, logger=logger, stop_event=stop_event, run_once=args.once)
+            run_monitor_loop(
+                config=config,
+                logger=logger,
+                stop_event=stop_event,
+                run_once=args.once,
+                status_store=status_store,
+                check_now_event=check_now_event,
+            )
         else:
             monitor_thread = threading.Thread(
                 target=run_monitor_loop,
@@ -994,12 +1559,21 @@ def main() -> None:
                     "logger": logger,
                     "stop_event": stop_event,
                     "run_once": False,
+                    "status_store": status_store,
+                    "check_now_event": check_now_event,
                 },
                 name="internet-monitor",
                 daemon=True,
             )
             monitor_thread.start()
-            run_with_tray(config=config, logger=logger, stop_event=stop_event, monitor_thread=monitor_thread)
+            run_with_tray(
+                config=config,
+                logger=logger,
+                stop_event=stop_event,
+                monitor_thread=monitor_thread,
+                status_store=status_store,
+                check_now_event=check_now_event,
+            )
     except KeyboardInterrupt:
         if logger:
             logger.info("Stopping on keyboard interrupt.")
