@@ -3,7 +3,7 @@
 Утилита для Windows, которая отслеживает:
 
 - доступность интернета (`online/offline`);
-- страну и публичный IP (удобно для контроля VPN/маршрутизации);
+- страну подключения (удобно для контроля VPN/маршрутизации);
 - доступность ChatGPT отдельной проверкой.
 
 По умолчанию приложение работает в системном трее. Клик по иконке открывает меню со статусом, ручной проверкой, открытием лога и выходом.
@@ -13,8 +13,8 @@
 - Режим трея по умолчанию (`python main.py`).
 - Защита от запуска второй копии (single instance через mutex).
 - Периодическая проверка сети с несколькими endpoint и повторами.
-- Параллельные быстрые проверки сети, страны/публичного IP и ChatGPT.
-- Уведомления о смене статуса сети, страны и публичного IP.
+- Параллельные быстрые проверки сети, страны и ChatGPT.
+- Уведомления о смене статуса сети и страны.
 - Отдельные уведомления о смене доступности ChatGPT.
 - По умолчанию уведомления о стране ограничены переходами, связанными с Россией.
 - Ротация логов.
@@ -98,7 +98,6 @@ powershell -ExecutionPolicy Bypass -File .\install_startup.ps1
 - `country_lookup_urls`, `country_lookup_no_cache`: API и режим запрета кеша для гео-определения.
 - `chatgpt_probe_urls`, `chatgpt_success_confirmations`, `chatgpt_fail_confirmations`: отдельная проверка доступности ChatGPT (`TCP`, `HEAD` или `GET`).
 - `notify_only_russia_transitions`, `russia_country_codes`, `russia_country_names`: логика фильтрации уведомлений по РФ.
-- `notify_on_public_ip_change`: уведомлять ли при смене публичного IP.
 - `notify_on_chatgpt_status_change`: уведомлять ли при смене доступности ChatGPT.
 - `show_app_started_notification`, `app_started_title`, `app_started_message`: стартовое уведомление.
 - `notification_cooldowns_seconds`, `dedup_window_seconds`: защита от спама уведомлениями.

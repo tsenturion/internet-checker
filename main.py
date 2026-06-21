@@ -2,10 +2,10 @@ import argparse
 import concurrent.futures
 import copy
 import ctypes
-from ctypes import wintypes
 import json
 import logging
 import os
+import queue
 import socket
 import ssl
 import sys
@@ -17,10 +17,11 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
+import tkinter as tk
 
 import requests
 from PIL import Image, ImageDraw
-from pystray import Icon, Menu, MenuItem
+from pystray import Icon
 try:
     from pystray._util import win32 as pystray_win32
 except Exception:
@@ -56,7 +57,6 @@ DEFAULT_CONFIG = {
         "startup": 0,
         "internet_status": 5,
         "country_change": 0,
-        "public_ip_change": 2,
         "chatgpt_status": 5,
     },
     "dedup_window_seconds": 30,
@@ -81,7 +81,6 @@ DEFAULT_CONFIG = {
         {"url": "https://api.openai.com/v1/models", "method": "TCP"},
     ],
     "country_lookup_no_cache": True,
-    "notify_on_public_ip_change": True,
     "tray_icon_tooltip": "Internet Checker",
     "tray_show_status_label": "Показать статус",
     "tray_check_now_label": "Проверить сейчас",
@@ -95,7 +94,6 @@ class NetworkState:
     online: bool
     country_name: Optional[str]
     country_code: Optional[str]
-    public_ip: Optional[str]
     chatgpt_online: Optional[bool]
     checked_at: datetime
 
@@ -176,7 +174,6 @@ class StateDebouncer:
         self._stable_online: Optional[bool] = None
         self._stable_country_name: Optional[str] = None
         self._stable_country_code: Optional[str] = None
-        self._stable_public_ip: Optional[str] = None
         self._stable_chatgpt_online: Optional[bool] = None
 
         self._online_success_streak = 0
@@ -204,10 +201,6 @@ class StateDebouncer:
     @property
     def stable_country_code(self) -> Optional[str]:
         return self._stable_country_code
-
-    @property
-    def stable_public_ip(self) -> Optional[str]:
-        return self._stable_public_ip
 
     @property
     def stable_chatgpt_online(self) -> Optional[bool]:
@@ -238,15 +231,6 @@ class StateDebouncer:
             normalized_name = None
 
         return normalized_name, normalized_code
-
-    @staticmethod
-    def _normalize_public_ip(public_ip: Optional[str]) -> Optional[str]:
-        if not isinstance(public_ip, str):
-            return None
-        normalized = public_ip.strip()
-        if not normalized:
-            return None
-        return normalized
 
     def _reset_country_candidate(self) -> None:
         self._country_candidate_key = None
@@ -292,11 +276,9 @@ class StateDebouncer:
         raw_online: bool,
         raw_country_name: Optional[str],
         raw_country_code: Optional[str],
-        raw_public_ip: Optional[str],
         raw_chatgpt_online: bool,
     ) -> DebounceUpdate:
         raw_country_name, raw_country_code = self._normalize_country(raw_country_name, raw_country_code)
-        raw_public_ip = self._normalize_public_ip(raw_public_ip)
 
         online_changed = False
         country_changed = False
@@ -330,16 +312,12 @@ class StateDebouncer:
         if not self._stable_online:
             self._stable_country_name = None
             self._stable_country_code = None
-            self._stable_public_ip = None
             self._reset_country_candidate()
             return DebounceUpdate(
                 online_changed=online_changed,
                 country_changed=False,
                 chatgpt_changed=chatgpt_changed,
             )
-
-        if raw_public_ip:
-            self._stable_public_ip = raw_public_ip
 
         raw_key = self._country_key(raw_country_name, raw_country_code)
         stable_key = self._country_key(self._stable_country_name, self._stable_country_code)
@@ -601,7 +579,6 @@ def load_config(path: Path) -> dict:
     ] or ["russia", "Russia", "RUSSIA", "russian federation", "россия", "российская федерация"]
 
     config["country_lookup_no_cache"] = bool(config.get("country_lookup_no_cache", True))
-    config["notify_on_public_ip_change"] = bool(config.get("notify_on_public_ip_change", True))
     config["notify_on_chatgpt_status_change"] = bool(config.get("notify_on_chatgpt_status_change", True))
 
     return config
@@ -804,17 +781,17 @@ def check_connectivity(urls: list[str], timeout_seconds: float, attempts: int) -
     return False
 
 
-def parse_country_payload(data: dict) -> tuple[Optional[str], Optional[str], Optional[str]]:
+def parse_country_payload(data: dict) -> tuple[Optional[str], Optional[str]]:
     if not isinstance(data, dict):
-        return None, None, None
+        return None, None
 
     status = data.get("status")
     if isinstance(status, str) and status.lower() in {"fail", "error"}:
-        return None, None, None
+        return None, None
 
     success = data.get("success")
     if success is False:
-        return None, None, None
+        return None, None
 
     country_name = data.get("country_name")
     country_code = data.get("country_code")
@@ -829,12 +806,6 @@ def parse_country_payload(data: dict) -> tuple[Optional[str], Optional[str], Opt
         if not country_name:
             country_name = None
 
-    public_ip = data.get("ip")
-    if not public_ip:
-        public_ip = data.get("query")
-    if not public_ip:
-        public_ip = data.get("ipAddress")
-
     if isinstance(country_code, str):
         country_code = country_code.strip().upper() or None
     else:
@@ -845,15 +816,10 @@ def parse_country_payload(data: dict) -> tuple[Optional[str], Optional[str], Opt
     else:
         country_name = None
 
-    if isinstance(public_ip, str):
-        public_ip = public_ip.strip() or None
-    else:
-        public_ip = None
+    if country_code is None and country_name is None:
+        return None, None
 
-    if country_code is None and country_name is None and public_ip is None:
-        return None, None, None
-
-    return country_name, country_code, public_ip
+    return country_name, country_code
 
 
 def build_country_request_url(url: str, no_cache: bool) -> str:
@@ -867,7 +833,7 @@ def fetch_country_from_url(
     url: str,
     timeout_seconds: float,
     no_cache: bool,
-) -> tuple[Optional[str], Optional[str], Optional[str], str, Optional[str]]:
+) -> tuple[Optional[str], Optional[str], str, Optional[str]]:
     headers = {"User-Agent": "InternetChecker/1.0"}
     if no_cache:
         headers.update({"Cache-Control": "no-cache", "Pragma": "no-cache"})
@@ -879,12 +845,12 @@ def fetch_country_from_url(
             headers=headers,
         )
         response.raise_for_status()
-        country_name, country_code, public_ip = parse_country_payload(response.json())
-        if country_name or country_code or public_ip:
-            return country_name, country_code, public_ip, url, None
-        return None, None, None, url, "empty response"
+        country_name, country_code = parse_country_payload(response.json())
+        if country_name or country_code:
+            return country_name, country_code, url, None
+        return None, None, url, "empty response"
     except (requests.RequestException, ValueError) as exc:
-        return None, None, None, url, type(exc).__name__
+        return None, None, url, type(exc).__name__
 
 
 def fetch_country(
@@ -892,10 +858,10 @@ def fetch_country(
     timeout_seconds: float,
     logger: logging.Logger,
     no_cache: bool,
-) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
     urls = [url for url in urls if isinstance(url, str) and url.strip()]
     if not urls:
-        return None, None, None, None
+        return None, None, None
 
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=min(len(urls), 6),
@@ -909,10 +875,10 @@ def fetch_country(
 
     try:
         for future in concurrent.futures.as_completed(futures, timeout=float(timeout_seconds) + 0.75):
-            country_name, country_code, public_ip, source_url, error = future.result()
-            if country_name or country_code or public_ip:
+            country_name, country_code, source_url, error = future.result()
+            if country_name or country_code:
                 executor.shutdown(wait=False, cancel_futures=True)
-                return country_name, country_code, public_ip, source_url
+                return country_name, country_code, source_url
             if error:
                 errors.append(f"{source_url} ({error})")
     except concurrent.futures.TimeoutError:
@@ -922,7 +888,7 @@ def fetch_country(
 
     if errors:
         logger.info("Country lookup failed on all APIs: %s", "; ".join(errors))
-    return None, None, None, None
+    return None, None, None
 
 
 def check_chatgpt(probes: list[dict[str, str]], timeout_seconds: float) -> bool:
@@ -958,8 +924,7 @@ def snapshot_text(state: NetworkState) -> str:
         return f"Internet: OFFLINE | ChatGPT: {format_chatgpt_status(state.chatgpt_online)}"
     country = state.country_name or state.country_code or "Unknown"
     chatgpt = format_chatgpt_status(state.chatgpt_online)
-    ip_suffix = f" | IP: {state.public_ip}" if state.public_ip else ""
-    return f"Internet: ONLINE | Country: {country} | ChatGPT: {chatgpt}{ip_suffix}"
+    return f"Internet: ONLINE | Country: {country} | ChatGPT: {chatgpt}"
 
 
 def format_chatgpt_status(value: Optional[bool]) -> str:
@@ -995,7 +960,6 @@ def collect_events(
     current: NetworkState,
     notify_on_start: bool,
     notify_only_russia_transitions: bool,
-    notify_on_public_ip_change: bool,
     notify_on_chatgpt_status_change: bool,
     russia_codes: set[str],
     russia_names: set[str],
@@ -1064,24 +1028,6 @@ def collect_events(
             )
         )
 
-    if (
-        notify_on_public_ip_change
-        and current.online
-        and prev.public_ip
-        and current.public_ip
-        and prev.public_ip != current.public_ip
-        and prev_country_key == current_country_key
-    ):
-        if not (notify_only_russia_transitions and not (prev_is_russia or current_is_russia)):
-            country = current.country_name or current.country_code or "Unknown"
-            events.append(
-                NotificationEvent(
-                    event_type="public_ip_change",
-                    message=f"Public IP changed: {prev.public_ip} -> {current.public_ip}\nCountry: {country}",
-                    fingerprint=f"public_ip_change:{prev.public_ip}->{current.public_ip}:{current_country_key or country}",
-                )
-            )
-
     return events
 
 
@@ -1100,34 +1046,217 @@ def create_tray_image() -> Image.Image:
     return image
 
 
-class ClickMenuIcon(Icon):
-    def _show_click_menu(self) -> bool:
-        if pystray_win32 is None or not self._menu_handle:
-            return False
+class TrayPopupController:
+    def __init__(
+        self,
+        config: dict,
+        logger: logging.Logger,
+        status_store: StatusStore,
+        check_now_event: threading.Event,
+        stop_event: threading.Event,
+    ) -> None:
+        self._config = config
+        self._logger = logger
+        self._status_store = status_store
+        self._check_now_event = check_now_event
+        self._stop_event = stop_event
+        self._commands: queue.Queue[str] = queue.Queue()
+        self._ready = threading.Event()
+        self._root: Optional[tk.Tk] = None
+        self._popup: Optional[tk.Toplevel] = None
+        self._status_frame: Optional[tk.Frame] = None
+        self._thread = threading.Thread(target=self._run, name="tray-popup-ui", daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=3)
 
-        self.update_menu()
-        pystray_win32.SetForegroundWindow(self._hwnd)
+    def show(self) -> None:
+        self._commands.put("show")
 
-        point = wintypes.POINT()
-        pystray_win32.GetCursorPos(ctypes.byref(point))
+    def stop(self) -> None:
+        self._commands.put("stop")
 
-        hmenu, descriptors = self._menu_handle
-        index = pystray_win32.TrackPopupMenuEx(
-            hmenu,
-            pystray_win32.TPM_RIGHTALIGN | pystray_win32.TPM_BOTTOMALIGN | pystray_win32.TPM_RETURNCMD,
-            point.x,
-            point.y,
-            self._menu_hwnd,
-            None,
+    def _run(self) -> None:
+        self._root = tk.Tk()
+        self._root.withdraw()
+        self._root.title("Internet Checker")
+        self._ready.set()
+        self._process_commands()
+        self._refresh_popup()
+        self._root.mainloop()
+
+    def _process_commands(self) -> None:
+        while True:
+            try:
+                command = self._commands.get_nowait()
+            except queue.Empty:
+                break
+
+            if command == "show":
+                self._show_popup()
+            elif command == "hide":
+                self._hide_popup()
+            elif command == "stop":
+                self._hide_popup()
+                if self._root is not None:
+                    self._root.quit()
+                return
+
+        if self._root is not None:
+            self._root.after(50, self._process_commands)
+
+    def _build_popup(self) -> None:
+        if self._root is None:
+            return
+
+        popup = tk.Toplevel(self._root)
+        popup.withdraw()
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        popup.configure(background="#9ca3af")
+        popup.bind("<Escape>", lambda _event: self._hide_popup())
+        popup.bind("<FocusOut>", lambda _event: self._root.after(120, self._hide_if_unfocused))
+
+        body = tk.Frame(popup, background="#ffffff", borderwidth=0)
+        body.pack(fill="both", expand=True, padx=1, pady=1)
+
+        self._status_frame = tk.Frame(body, background="#ffffff", borderwidth=0)
+        self._status_frame.pack(fill="x", padx=0, pady=(4, 3))
+
+        self._separator(body)
+        self._menu_button(body, str(self._config["tray_show_status_label"]), self._show_status_notification)
+        self._menu_button(body, str(self._config["tray_check_now_label"]), self._check_now)
+        self._menu_button(body, str(self._config["tray_open_log_label"]), self._open_log)
+        self._separator(body)
+        self._menu_button(body, str(self._config["tray_exit_label"]), self._exit_app)
+
+        self._popup = popup
+
+    @staticmethod
+    def _separator(parent: tk.Widget) -> None:
+        tk.Frame(parent, height=1, background="#e5e7eb").pack(fill="x", padx=0, pady=3)
+
+    def _menu_button(self, parent: tk.Widget, text: str, command) -> None:
+        button = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            anchor="w",
+            relief="flat",
+            borderwidth=0,
+            padx=8,
+            pady=4,
+            background="#ffffff",
+            activebackground="#e5f0ff",
+            foreground="#111827",
+            activeforeground="#111827",
+            font=("Segoe UI", 9),
         )
-        if index > 0:
-            descriptors[index - 1](self)
-        return True
+        button.pack(fill="x", padx=0, pady=0)
+
+    def _show_popup(self) -> None:
+        if self._popup is None or not self._popup.winfo_exists():
+            self._build_popup()
+        if self._popup is None or self._root is None:
+            return
+
+        self._refresh_popup()
+        pointer_x = self._root.winfo_pointerx()
+        pointer_y = self._root.winfo_pointery()
+        self._popup.update_idletasks()
+        width = self._popup.winfo_reqwidth()
+        height = self._popup.winfo_reqheight()
+        screen_width = self._popup.winfo_screenwidth()
+        screen_height = self._popup.winfo_screenheight()
+        x = min(max(0, pointer_x - width + 8), max(0, screen_width - width - 4))
+        y = min(max(0, pointer_y - height - 8), max(0, screen_height - height - 4))
+        self._popup.geometry(f"+{x}+{y}")
+        self._popup.deiconify()
+        self._popup.lift()
+        self._popup.focus_force()
+
+    def _hide_popup(self) -> None:
+        if self._popup is not None and self._popup.winfo_exists():
+            self._popup.withdraw()
+
+    def _hide_if_unfocused(self) -> None:
+        if self._root is None or self._popup is None or not self._popup.winfo_viewable():
+            return
+        focused = self._root.focus_get()
+        if focused is None or not str(focused).startswith(str(self._popup)):
+            self._hide_popup()
+
+    def _refresh_popup(self) -> None:
+        if self._popup is not None and self._popup.winfo_exists() and self._popup.winfo_viewable():
+            self._render_status()
+        if self._root is not None:
+            self._root.after(250, self._refresh_popup)
+
+    def _render_status(self) -> None:
+        if self._status_frame is None:
+            return
+        for child in self._status_frame.winfo_children():
+            child.destroy()
+        for line in tray_status_lines(self._status_store.snapshot()):
+            tk.Label(
+                self._status_frame,
+                text=line,
+                anchor="w",
+                justify="left",
+                background="#ffffff",
+                foreground="#111827",
+                padx=8,
+                pady=1,
+                font=("Segoe UI", 9),
+            ).pack(fill="x")
+
+    def _show_status_notification(self) -> None:
+        snapshot = self._status_store.snapshot()
+        if snapshot.state is not None:
+            message = snapshot_text(snapshot.state)
+        elif snapshot.last_error:
+            message = f"Error: {snapshot.last_error}"
+        elif snapshot.checking:
+            message = "Checking..."
+        else:
+            message = "No data yet."
+        try:
+            toast = Toast()
+            toast.text_fields = ["Internet Checker", message]
+            WindowsToaster("Internet Checker").show_toast(toast)
+        except Exception as exc:
+            self._logger.info("Tray status notification failed: %s", exc)
+
+    def _check_now(self) -> None:
+        self._logger.info("Manual check requested from tray.")
+        self._status_store.set_checking(True)
+        self._check_now_event.set()
+        self._render_status()
+
+    def _open_log(self) -> None:
+        try:
+            log_path = Path(str(self._config["log_file_path"]))
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if not log_path.exists():
+                log_path.touch()
+            os.startfile(str(log_path))
+        except Exception as exc:
+            self._logger.info("Opening log file failed: %s", exc)
+
+    def _exit_app(self) -> None:
+        self._logger.info("Tray exit requested.")
+        self._stop_event.set()
+        self._hide_popup()
+
+
+class ClickMenuIcon(Icon):
+    def __init__(self, *args, popup_controller: TrayPopupController, **kwargs):
+        self._popup_controller = popup_controller
+        super().__init__(*args, **kwargs)
 
     def _on_notify(self, wparam, lparam):
         if pystray_win32 is not None and lparam in {pystray_win32.WM_LBUTTONUP, pystray_win32.WM_RBUTTONUP}:
-            if self._show_click_menu():
-                return
+            self._popup_controller.show()
+            return
         return super()._on_notify(wparam, lparam)
 
 
@@ -1147,8 +1276,6 @@ def tray_status_lines(snapshot: StatusSnapshot) -> list[str]:
         f"Страна: {country}",
         f"ChatGPT: {format_chatgpt_status(state.chatgpt_online)}",
     ]
-    if state.public_ip:
-        lines.append(f"IP: {state.public_ip}")
     lines.append(f"Обновлено: {checked_at}")
     if snapshot.checking:
         lines.append("Проверка: выполняется")
@@ -1163,39 +1290,6 @@ def tray_tooltip(base_title: str, snapshot: StatusSnapshot) -> str:
     chatgpt = format_chatgpt_status(state.chatgpt_online)
     country = state.country_name or state.country_code or "Unknown"
     return f"{base_title} - Internet {internet}, ChatGPT {chatgpt}, {country}"
-
-
-def make_tray_menu(
-    config: dict,
-    logger: logging.Logger,
-    status_store: StatusStore,
-    check_now_event: threading.Event,
-    stop_event: threading.Event,
-) -> Menu:
-    def items():
-        snapshot = status_store.snapshot()
-        for line in tray_status_lines(snapshot):
-            yield MenuItem(line, None, enabled=False)
-        yield Menu.SEPARATOR
-        yield MenuItem(
-            str(config["tray_show_status_label"]),
-            lambda icon, item: _on_tray_show_status(icon, logger, status_store),
-        )
-        yield MenuItem(
-            str(config["tray_check_now_label"]),
-            lambda icon, item: _on_tray_check_now(icon, logger, status_store, check_now_event),
-        )
-        yield MenuItem(
-            str(config["tray_open_log_label"]),
-            lambda icon, item: _on_tray_open_log(logger, Path(str(config["log_file_path"]))),
-        )
-        yield Menu.SEPARATOR
-        yield MenuItem(
-            str(config["tray_exit_label"]),
-            lambda icon, item: _on_tray_exit(icon, logger, stop_event),
-        )
-
-    return Menu(items)
 
 
 def wait_for_next_cycle(
@@ -1217,6 +1311,61 @@ def future_result(future: concurrent.futures.Future, default: object, logger: lo
     except Exception as exc:
         logger.info("%s failed: %s", label, exc)
         return default
+
+
+def run_cycle_checks(
+    config: dict,
+    logger: logging.Logger,
+    country_urls: list[str],
+) -> tuple[bool, Optional[str], Optional[str], Optional[str], bool]:
+    timeout = float(config["request_timeout_seconds"])
+    overall_timeout = max(1.0, timeout + 1.0)
+    defaults = {
+        "online": False,
+        "country": (None, None, None),
+        "chatgpt": False,
+    }
+    results = dict(defaults)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="monitor-cycle")
+    future_map = {
+        executor.submit(
+            check_connectivity,
+            urls=config["connectivity_urls"],
+            timeout_seconds=timeout,
+            attempts=int(config["connectivity_attempts"]),
+        ): ("online", "Connectivity check"),
+        executor.submit(
+            fetch_country,
+            urls=country_urls,
+            timeout_seconds=timeout,
+            logger=logger,
+            no_cache=bool(config.get("country_lookup_no_cache", True)),
+        ): ("country", "Country lookup"),
+        executor.submit(
+            check_chatgpt,
+            probes=config["chatgpt_probe_urls"],
+            timeout_seconds=timeout,
+        ): ("chatgpt", "ChatGPT check"),
+    }
+
+    try:
+        done, pending = concurrent.futures.wait(future_map, timeout=overall_timeout)
+        for future in done:
+            key, label = future_map[future]
+            results[key] = future_result(future, defaults[key], logger, label)
+
+        for future in pending:
+            _key, label = future_map[future]
+            logger.info("%s timed out after %.1fs", label, overall_timeout)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    raw_country_name, raw_country_code, country_source = results["country"]
+    raw_connectivity_online = bool(results["online"])
+    raw_chatgpt_online = bool(results["chatgpt"])
+    raw_online = raw_connectivity_online or raw_chatgpt_online or bool(raw_country_name or raw_country_code)
+
+    return raw_online, raw_country_name, raw_country_code, country_source, raw_chatgpt_online
 
 
 def run_monitor_loop(
@@ -1269,52 +1418,25 @@ def run_monitor_loop(
             if last_country_source and last_country_source in country_urls:
                 country_urls = [last_country_source] + [url for url in country_urls if url != last_country_source]
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="monitor-cycle") as executor:
-                online_future = executor.submit(
-                    check_connectivity,
-                    urls=config["connectivity_urls"],
-                    timeout_seconds=timeout,
-                    attempts=int(config["connectivity_attempts"]),
-                )
-                country_future = executor.submit(
-                    fetch_country,
-                    urls=country_urls,
-                    timeout_seconds=timeout,
-                    logger=logger,
-                    no_cache=bool(config.get("country_lookup_no_cache", True)),
-                )
-                chatgpt_future = executor.submit(
-                    check_chatgpt,
-                    probes=config["chatgpt_probe_urls"],
-                    timeout_seconds=timeout,
-                )
-
-                raw_country_name, raw_country_code, raw_public_ip, country_source = future_result(
-                    country_future,
-                    (None, None, None, None),
-                    logger,
-                    "Country lookup",
-                )
-                raw_chatgpt_online = bool(future_result(chatgpt_future, False, logger, "ChatGPT check"))
-                raw_connectivity_online = bool(future_result(online_future, False, logger, "Connectivity check"))
+            raw_online, raw_country_name, raw_country_code, country_source, raw_chatgpt_online = run_cycle_checks(
+                config=config,
+                logger=logger,
+                country_urls=country_urls,
+            )
 
             if country_source and country_source != last_country_source:
                 logger.info("Country API source selected: %s", country_source)
                 last_country_source = country_source
 
-            raw_online = raw_connectivity_online or raw_chatgpt_online or bool(
-                raw_country_name or raw_country_code or raw_public_ip
-            )
-
             debouncer.update(
                 raw_online,
                 raw_country_name,
                 raw_country_code,
-                raw_public_ip,
                 raw_chatgpt_online,
             )
             if not debouncer.has_stable_online:
                 logger.info("No notification. State: warming up connectivity checks.")
+                status_store.set_checking(False)
                 if run_once:
                     break
                 wait_for_next_cycle(stop_event, check_now_event, int(config["check_interval_seconds"]))
@@ -1324,7 +1446,6 @@ def run_monitor_loop(
                 online=debouncer.stable_online,
                 country_name=debouncer.stable_country_name if debouncer.stable_online else None,
                 country_code=debouncer.stable_country_code if debouncer.stable_online else None,
-                public_ip=debouncer.stable_public_ip if debouncer.stable_online else None,
                 chatgpt_online=debouncer.stable_chatgpt_online if debouncer.has_stable_chatgpt else None,
                 checked_at=now,
             )
@@ -1335,7 +1456,6 @@ def run_monitor_loop(
                 current=current_state,
                 notify_on_start=bool(config["notify_on_start"]),
                 notify_only_russia_transitions=bool(config["notify_only_russia_transitions"]),
-                notify_on_public_ip_change=bool(config.get("notify_on_public_ip_change", True)),
                 notify_on_chatgpt_status_change=bool(config.get("notify_on_chatgpt_status_change", True)),
                 russia_codes=set(config["russia_country_codes"]),
                 russia_names=set(config["russia_country_names"]),
@@ -1389,17 +1509,19 @@ def run_with_tray(
     status_store: StatusStore,
     check_now_event: threading.Event,
 ) -> None:
+    popup_controller = TrayPopupController(
+        config=config,
+        logger=logger,
+        status_store=status_store,
+        check_now_event=check_now_event,
+        stop_event=stop_event,
+    )
     tray_icon = ClickMenuIcon(
         name="internet-checker",
         icon=create_tray_image(),
         title=tray_tooltip(str(config["tray_icon_tooltip"]), status_store.snapshot()),
-        menu=make_tray_menu(
-            config=config,
-            logger=logger,
-            status_store=status_store,
-            check_now_event=check_now_event,
-            stop_event=stop_event,
-        ),
+        menu=None,
+        popup_controller=popup_controller,
     )
 
     def watch_monitor() -> None:
@@ -1425,56 +1547,8 @@ def run_with_tray(
 
     tray_icon.run()
     stop_event.set()
+    popup_controller.stop()
     monitor_thread.join()
-
-
-def _on_tray_show_status(icon: Icon, logger: logging.Logger, status_store: StatusStore) -> None:
-    snapshot = status_store.snapshot()
-    if snapshot.state is not None:
-        message = snapshot_text(snapshot.state)
-    elif snapshot.last_error:
-        message = f"Error: {snapshot.last_error}"
-    elif snapshot.checking:
-        message = "Checking..."
-    else:
-        message = "No data yet."
-
-    try:
-        icon.notify(message, "Internet Checker")
-    except Exception as exc:
-        logger.info("Tray status notification failed: %s", exc)
-
-
-def _on_tray_check_now(
-    icon: Icon,
-    logger: logging.Logger,
-    status_store: StatusStore,
-    check_now_event: threading.Event,
-) -> None:
-    logger.info("Manual check requested from tray.")
-    status_store.set_checking(True)
-    check_now_event.set()
-    try:
-        icon.update_menu()
-        icon.title = "Internet Checker - checking"
-    except Exception:
-        pass
-
-
-def _on_tray_open_log(logger: logging.Logger, log_path: Path) -> None:
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        if not log_path.exists():
-            log_path.touch()
-        os.startfile(str(log_path))
-    except Exception as exc:
-        logger.info("Opening log file failed: %s", exc)
-
-
-def _on_tray_exit(icon: Icon, logger: logging.Logger, stop_event: threading.Event) -> None:
-    logger.info("Tray exit requested.")
-    stop_event.set()
-    icon.stop()
 
 
 def parse_args() -> argparse.Namespace:

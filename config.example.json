@@ -28,7 +28,6 @@
     "startup": 0,
     "internet_status": 5,
     "country_change": 0,
-    "public_ip_change": 2,
     "chatgpt_status": 5
   },
   "dedup_window_seconds": 30,
@@ -59,7 +58,6 @@
     }
   ],
   "country_lookup_no_cache": true,
-  "notify_on_public_ip_change": true,
   "tray_icon_tooltip": "Internet Checker",
   "tray_show_status_label": "Показать статус",
   "tray_check_now_label": "Проверить сейчас",
