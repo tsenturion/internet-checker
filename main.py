@@ -920,11 +920,13 @@ def check_chatgpt(probes: list[dict[str, str]], timeout_seconds: float) -> bool:
 
 
 def snapshot_text(state: NetworkState) -> str:
+    country = state.country_name or state.country_code or "Unknown"
+    if state.online and state.chatgpt_online is True:
+        return f"ONLINE | {country}"
     if not state.online:
         return f"Internet: OFFLINE | ChatGPT: {format_chatgpt_status(state.chatgpt_online)}"
-    country = state.country_name or state.country_code or "Unknown"
     chatgpt = format_chatgpt_status(state.chatgpt_online)
-    return f"Internet: ONLINE | Country: {country} | ChatGPT: {chatgpt}"
+    return f"Internet: ONLINE | {country} | ChatGPT: {chatgpt}"
 
 
 def format_chatgpt_status(value: Optional[bool]) -> str:
@@ -1271,11 +1273,17 @@ def tray_status_lines(snapshot: StatusSnapshot) -> list[str]:
     internet = "ONLINE" if state.online else "OFFLINE"
     country = state.country_name or state.country_code or "Unknown"
     checked_at = state.checked_at.strftime("%H:%M:%S")
-    lines = [
-        f"Интернет: {internet}",
-        f"Страна: {country}",
-        f"ChatGPT: {format_chatgpt_status(state.chatgpt_online)}",
-    ]
+    if state.online and state.chatgpt_online is True:
+        lines = [
+            "ONLINE",
+            country,
+        ]
+    else:
+        lines = [
+            f"Интернет: {internet}",
+            country,
+            f"ChatGPT: {format_chatgpt_status(state.chatgpt_online)}",
+        ]
     lines.append(f"Обновлено: {checked_at}")
     if snapshot.checking:
         lines.append("Проверка: выполняется")
@@ -1287,8 +1295,10 @@ def tray_tooltip(base_title: str, snapshot: StatusSnapshot) -> str:
         return f"{base_title} - checking" if snapshot.checking else base_title
     state = snapshot.state
     internet = "ONLINE" if state.online else "OFFLINE"
-    chatgpt = format_chatgpt_status(state.chatgpt_online)
     country = state.country_name or state.country_code or "Unknown"
+    if state.online and state.chatgpt_online is True:
+        return f"{base_title} - ONLINE, {country}"
+    chatgpt = format_chatgpt_status(state.chatgpt_online)
     return f"{base_title} - Internet {internet}, ChatGPT {chatgpt}, {country}"
 
 
