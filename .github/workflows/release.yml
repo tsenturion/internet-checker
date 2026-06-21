@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.0.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build Windows EXE and publish release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Compile source
+        run: python -m compileall main.py
+
+      - name: Build EXE
+        shell: pwsh
+        run: .\build_exe.ps1
+
+      - name: Resolve release tag
+        id: release
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tag = "${{ inputs.tag }}".Trim()
+          } else {
+            $tag = "${{ github.ref_name }}".Trim()
+          }
+
+          if (-not $tag) {
+            throw "Release tag is empty."
+          }
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          $asset = "dist\InternetChecker.exe"
+          if (-not (Test-Path $asset)) {
+            throw "Release asset not found: $asset"
+          }
+
+          gh release view $env:RELEASE_TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_TAG $asset --clobber
+          } else {
+            gh release create $env:RELEASE_TAG $asset `
+              --target $env:TARGET_SHA `
+              --title "InternetChecker $env:RELEASE_TAG" `
+              --generate-notes
+          }

@@ -81,6 +81,19 @@ powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 
 - `dist\InternetChecker.exe`
 
+## Release через GitHub Actions
+
+EXE можно собирать не локально, а в GitHub Actions. Workflow `.github/workflows/release.yml` собирает `dist\InternetChecker.exe` на Windows runner и публикует файл в GitHub Release.
+
+Автоматический релиз по тегу:
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Ручной релиз: GitHub -> Actions -> Release -> Run workflow, затем указать tag, например `v0.1.0`.
+
 ## Установка в автозапуск
 
 Копирует standalone EXE прямо в папку Startup:
