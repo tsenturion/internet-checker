@@ -1,11 +1,12 @@
 {
   "check_interval_seconds": 5,
   "request_timeout_seconds": 1.5,
+  "chatgpt_request_timeout_seconds": 8.0,
   "connectivity_success_confirmations": 1,
   "connectivity_fail_confirmations": 1,
   "country_confirmations": 1,
   "chatgpt_success_confirmations": 1,
-  "chatgpt_fail_confirmations": 1,
+  "chatgpt_fail_confirmations": 3,
   "notify_on_chatgpt_status_change": true,
   "notify_only_russia_transitions": true,
   "russia_country_codes": [
@@ -50,11 +51,8 @@
   "chatgpt_probe_urls": [
     {
       "url": "https://chatgpt.com/",
-      "method": "TCP"
-    },
-    {
-      "url": "https://api.openai.com/v1/models",
-      "method": "TCP"
+      "method": "GET",
+      "must_contain": "ChatGPT"
     }
   ],
   "country_lookup_no_cache": true,

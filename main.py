@@ -32,11 +32,12 @@ from windows_toasts import Toast, ToastDuration, WindowsToaster
 DEFAULT_CONFIG = {
     "check_interval_seconds": 5,
     "request_timeout_seconds": 1.5,
+    "chatgpt_request_timeout_seconds": 8.0,
     "connectivity_success_confirmations": 1,
     "connectivity_fail_confirmations": 1,
     "country_confirmations": 1,
     "chatgpt_success_confirmations": 1,
-    "chatgpt_fail_confirmations": 1,
+    "chatgpt_fail_confirmations": 3,
     "notify_on_chatgpt_status_change": True,
     "notify_only_russia_transitions": True,
     "russia_country_codes": ["RU"],
@@ -77,8 +78,7 @@ DEFAULT_CONFIG = {
         "https://ipapi.co/json/",
     ],
     "chatgpt_probe_urls": [
-        {"url": "https://chatgpt.com/", "method": "TCP"},
-        {"url": "https://api.openai.com/v1/models", "method": "TCP"},
+        {"url": "https://chatgpt.com/", "method": "GET", "must_contain": "ChatGPT"},
     ],
     "country_lookup_no_cache": True,
     "tray_icon_tooltip": "Internet Checker",
@@ -456,11 +456,14 @@ def normalize_probe_urls(value: object, default: list[dict[str, str]], default_m
         if isinstance(item, str):
             url = item.strip()
             method = default_method
+            must_contain = None
         elif isinstance(item, dict):
             raw_url = item.get("url")
             url = raw_url.strip() if isinstance(raw_url, str) else ""
             raw_method = item.get("method", default_method)
             method = raw_method.strip().upper() if isinstance(raw_method, str) else default_method
+            raw_must_contain = item.get("must_contain")
+            must_contain = raw_must_contain.strip() if isinstance(raw_must_contain, str) else None
         else:
             continue
 
@@ -469,7 +472,10 @@ def normalize_probe_urls(value: object, default: list[dict[str, str]], default_m
         if method not in {"GET", "HEAD", "TCP"}:
             method = default_method
 
-        probes.append({"url": url, "method": method})
+        probe = {"url": url, "method": method}
+        if must_contain:
+            probe["must_contain"] = must_contain
+        probes.append(probe)
 
     return probes or copy.deepcopy(default)
 
@@ -530,6 +536,10 @@ def load_config(path: Path) -> dict:
 
     config["check_interval_seconds"] = max(1, int(config["check_interval_seconds"]))
     config["request_timeout_seconds"] = max(0.2, float(config["request_timeout_seconds"]))
+    config["chatgpt_request_timeout_seconds"] = max(
+        config["request_timeout_seconds"],
+        float(config.get("chatgpt_request_timeout_seconds", config["request_timeout_seconds"])),
+    )
     config["connectivity_attempts"] = max(1, int(config.get("connectivity_attempts", 1)))
     config["connectivity_success_confirmations"] = max(1, int(config["connectivity_success_confirmations"]))
     config["connectivity_fail_confirmations"] = max(1, int(config["connectivity_fail_confirmations"]))
@@ -753,6 +763,78 @@ def http_probe(url: str, timeout_seconds: float, method: str = "HEAD") -> tuple[
         return False, f"{method} {url} -> {type(exc).__name__}; {tcp_detail}"
 
 
+def response_contains_marker(response: requests.Response, marker: str, max_bytes: int = 512_000) -> bool:
+    marker_bytes = marker.encode("utf-8")
+    if not marker_bytes:
+        return True
+
+    tail = b""
+    scanned = 0
+    tail_size = max(0, len(marker_bytes) - 1)
+    for chunk in response.iter_content(chunk_size=8192):
+        if not chunk:
+            continue
+        scanned += len(chunk)
+        window = tail + chunk
+        if marker_bytes in window:
+            return True
+        if scanned >= max_bytes:
+            return False
+        tail = window[-tail_size:] if tail_size else b""
+
+    return False
+
+
+def check_chatgpt_probe(probe: dict[str, str], timeout_seconds: float) -> tuple[bool, str]:
+    url = probe.get("url", "").strip()
+    if not url:
+        return False, "empty ChatGPT probe URL"
+
+    method = probe.get("method", "GET").strip().upper()
+    if method == "TCP":
+        method = "GET"
+    if method not in {"GET", "HEAD"}:
+        method = "GET"
+
+    must_contain = probe.get("must_contain")
+    parsed_host = urlparse(url).hostname or ""
+    if not must_contain and method == "GET" and parsed_host.endswith("chatgpt.com"):
+        must_contain = "ChatGPT"
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0 Safari/537.36"
+        ),
+    }
+    try:
+        response = requests.request(
+            method=method,
+            url=url,
+            timeout=max(1.0, float(timeout_seconds)),
+            allow_redirects=True,
+            headers=headers,
+            stream=bool(must_contain and method == "GET"),
+        )
+
+        with response:
+            if response.status_code < 200 or response.status_code >= 400:
+                return False, f"{method} {url} -> HTTP {response.status_code}"
+
+            if must_contain:
+                if method == "HEAD":
+                    return False, f"{method} {url} -> HTTP {response.status_code}, no body to verify"
+                if not response_contains_marker(response, must_contain):
+                    return False, f"{method} {url} -> HTTP {response.status_code}, marker missing"
+
+            return True, f"{method} {url} -> HTTP {response.status_code}"
+    except requests.RequestException as exc:
+        return False, f"{method} {url} -> {type(exc).__name__}"
+
+
 def check_connectivity(urls: list[str], timeout_seconds: float, attempts: int) -> bool:
     urls = [url for url in urls if isinstance(url, str) and url.strip()]
     if not urls:
@@ -900,7 +982,7 @@ def check_chatgpt(probes: list[dict[str, str]], timeout_seconds: float) -> bool:
         thread_name_prefix="chatgpt-probe",
     )
     futures = [
-        executor.submit(http_probe, probe["url"], timeout_seconds, probe.get("method", "HEAD"))
+        executor.submit(check_chatgpt_probe, probe, timeout_seconds)
         for probe in probes
         if probe.get("url")
     ]
@@ -921,7 +1003,7 @@ def check_chatgpt(probes: list[dict[str, str]], timeout_seconds: float) -> bool:
 
 def snapshot_text(state: NetworkState) -> str:
     country = state.country_name or state.country_code or "Unknown"
-    if state.online and state.chatgpt_online is True:
+    if state.online and state.chatgpt_online is True and country != "Unknown":
         return f"ONLINE | {country}"
     if not state.online:
         return f"Internet: OFFLINE | ChatGPT: {format_chatgpt_status(state.chatgpt_online)}"
@@ -1273,7 +1355,7 @@ def tray_status_lines(snapshot: StatusSnapshot) -> list[str]:
     internet = "ONLINE" if state.online else "OFFLINE"
     country = state.country_name or state.country_code or "Unknown"
     checked_at = state.checked_at.strftime("%H:%M:%S")
-    if state.online and state.chatgpt_online is True:
+    if state.online and state.chatgpt_online is True and country != "Unknown":
         lines = [
             "ONLINE",
             country,
@@ -1296,7 +1378,7 @@ def tray_tooltip(base_title: str, snapshot: StatusSnapshot) -> str:
     state = snapshot.state
     internet = "ONLINE" if state.online else "OFFLINE"
     country = state.country_name or state.country_code or "Unknown"
-    if state.online and state.chatgpt_online is True:
+    if state.online and state.chatgpt_online is True and country != "Unknown":
         return f"{base_title} - ONLINE, {country}"
     chatgpt = format_chatgpt_status(state.chatgpt_online)
     return f"{base_title} - Internet {internet}, ChatGPT {chatgpt}, {country}"
@@ -1329,7 +1411,8 @@ def run_cycle_checks(
     country_urls: list[str],
 ) -> tuple[bool, Optional[str], Optional[str], Optional[str], bool]:
     timeout = float(config["request_timeout_seconds"])
-    overall_timeout = max(1.0, timeout + 1.0)
+    chatgpt_timeout = float(config["chatgpt_request_timeout_seconds"])
+    overall_timeout = max(1.0, timeout + 1.0, chatgpt_timeout + 0.75)
     defaults = {
         "online": False,
         "country": (None, None, None),
@@ -1354,7 +1437,7 @@ def run_cycle_checks(
         executor.submit(
             check_chatgpt,
             probes=config["chatgpt_probe_urls"],
-            timeout_seconds=timeout,
+            timeout_seconds=chatgpt_timeout,
         ): ("chatgpt", "ChatGPT check"),
     }
 

@@ -106,10 +106,10 @@ powershell -ExecutionPolicy Bypass -File .\install_startup.ps1
 
 ## Ключевые параметры `config.json`
 
-- `check_interval_seconds`, `request_timeout_seconds`: интервал опроса и таймаут запросов. Таймаут поддерживает дробные значения.
+- `check_interval_seconds`, `request_timeout_seconds`, `chatgpt_request_timeout_seconds`: интервал опроса, общий таймаут запросов и отдельный более терпимый таймаут проверки ChatGPT. Таймауты поддерживают дробные значения.
 - `connectivity_urls`, `connectivity_attempts`: источники и надежность проверки онлайн-статуса.
 - `country_lookup_urls`, `country_lookup_no_cache`: API и режим запрета кеша для гео-определения.
-- `chatgpt_probe_urls`, `chatgpt_success_confirmations`, `chatgpt_fail_confirmations`: отдельная проверка доступности ChatGPT (`TCP`, `HEAD` или `GET`).
+- `chatgpt_probe_urls`, `chatgpt_success_confirmations`, `chatgpt_fail_confirmations`: отдельная HTTP-проверка доступности ChatGPT (`GET` или `HEAD`; `must_contain` проверяет маркер в ответе). По умолчанию краткий сбой не переводит ChatGPT в `OFFLINE`: нужно несколько подряд неудачных проверок.
 - `notify_only_russia_transitions`, `russia_country_codes`, `russia_country_names`: логика фильтрации уведомлений по РФ.
 - `notify_on_chatgpt_status_change`: уведомлять ли при смене доступности ChatGPT.
 - `show_app_started_notification`, `app_started_title`, `app_started_message`: стартовое уведомление.
