@@ -36,3 +36,6 @@ config.json
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Инструкции для нейросетевых агентов
+AGENTS.md
