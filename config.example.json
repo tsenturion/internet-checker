@@ -1,13 +1,13 @@
 {
   "check_interval_seconds": 5,
   "request_timeout_seconds": 1.5,
-  "chatgpt_request_timeout_seconds": 8.0,
+  "service_request_timeout_seconds": 8.0,
   "connectivity_success_confirmations": 1,
   "connectivity_fail_confirmations": 1,
   "country_confirmations": 1,
-  "chatgpt_success_confirmations": 1,
-  "chatgpt_fail_confirmations": 3,
-  "notify_on_chatgpt_status_change": true,
+  "service_success_confirmations": 1,
+  "service_fail_confirmations": 3,
+  "notify_on_service_status_change": true,
   "notify_only_russia_transitions": true,
   "russia_country_codes": [
     "RU"
@@ -29,7 +29,7 @@
     "startup": 0,
     "internet_status": 5,
     "country_change": 0,
-    "chatgpt_status": 5
+    "service_status": 5
   },
   "dedup_window_seconds": 30,
   "single_instance_mutex_name": "Global\\InternetCheckerMutex",
@@ -41,18 +41,49 @@
   "connectivity_urls": [
     "http://www.msftconnecttest.com/connecttest.txt",
     "https://cloudflare.com/cdn-cgi/trace",
-    "https://clients3.google.com/generate_204"
+    "https://clients3.google.com/generate_204",
+    "tcp://8.8.8.8:53",
+    "tcp://8.8.4.4:53",
+    "tcp://9.9.9.9:53",
+    "tcp://208.67.222.222:53"
   ],
   "country_lookup_urls": [
     "https://ipwho.is/",
     "http://ip-api.com/json/?fields=status,country,countryCode,query",
     "https://ipapi.co/json/"
   ],
-  "chatgpt_probe_urls": [
+  "service_checks": [
     {
-      "url": "https://chatgpt.com/",
-      "method": "GET",
-      "must_contain": "ChatGPT"
+      "id": "chatgpt",
+      "name": "ChatGPT",
+      "probe_urls": [
+        {
+          "url": "https://chatgpt.com/",
+          "method": "GET",
+          "must_contain": "ChatGPT"
+        }
+      ]
+    },
+    {
+      "id": "netology",
+      "name": "Netology",
+      "probe_urls": [
+        {
+          "url": "https://netology.ru/",
+          "method": "GET"
+        }
+      ]
+    },
+    {
+      "id": "github",
+      "name": "GitHub",
+      "probe_urls": [
+        {
+          "url": "https://github.com/",
+          "method": "GET",
+          "must_contain": "GitHub"
+        }
+      ]
     }
   ],
   "country_lookup_no_cache": true,

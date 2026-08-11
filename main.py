@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import concurrent.futures
 import copy
@@ -6,9 +8,12 @@ import json
 import logging
 import os
 import queue
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -17,28 +22,44 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
-import tkinter as tk
+
+try:
+    import tkinter as tk
+except Exception:
+    tk = None
 
 import requests
 from PIL import Image, ImageDraw
-from pystray import Icon
+try:
+    from pystray import Icon
+except Exception:
+    Icon = None
 try:
     from pystray._util import win32 as pystray_win32
 except Exception:
     pystray_win32 = None
-from windows_toasts import Toast, ToastDuration, WindowsToaster
+try:
+    from windows_toasts import Toast, ToastDuration, WindowsToaster
+except Exception:
+    Toast = None
+    ToastDuration = None
+    WindowsToaster = None
+
+
+IS_WINDOWS = sys.platform.startswith("win")
+IS_MACOS = sys.platform == "darwin"
 
 
 DEFAULT_CONFIG = {
     "check_interval_seconds": 5,
     "request_timeout_seconds": 1.5,
-    "chatgpt_request_timeout_seconds": 8.0,
+    "service_request_timeout_seconds": 8.0,
     "connectivity_success_confirmations": 1,
     "connectivity_fail_confirmations": 1,
     "country_confirmations": 1,
-    "chatgpt_success_confirmations": 1,
-    "chatgpt_fail_confirmations": 3,
-    "notify_on_chatgpt_status_change": True,
+    "service_success_confirmations": 1,
+    "service_fail_confirmations": 3,
+    "notify_on_service_status_change": True,
     "notify_only_russia_transitions": True,
     "russia_country_codes": ["RU"],
     "russia_country_names": [
@@ -58,7 +79,7 @@ DEFAULT_CONFIG = {
         "startup": 0,
         "internet_status": 5,
         "country_change": 0,
-        "chatgpt_status": 5,
+        "service_status": 5,
     },
     "dedup_window_seconds": 30,
     "single_instance_mutex_name": "Global\\InternetCheckerMutex",
@@ -71,14 +92,38 @@ DEFAULT_CONFIG = {
         "http://www.msftconnecttest.com/connecttest.txt",
         "https://cloudflare.com/cdn-cgi/trace",
         "https://clients3.google.com/generate_204",
+        "tcp://8.8.8.8:53",
+        "tcp://8.8.4.4:53",
+        "tcp://9.9.9.9:53",
+        "tcp://208.67.222.222:53",
     ],
     "country_lookup_urls": [
         "https://ipwho.is/",
         "http://ip-api.com/json/?fields=status,country,countryCode,query",
         "https://ipapi.co/json/",
     ],
-    "chatgpt_probe_urls": [
-        {"url": "https://chatgpt.com/", "method": "GET", "must_contain": "ChatGPT"},
+    "service_checks": [
+        {
+            "id": "chatgpt",
+            "name": "ChatGPT",
+            "probe_urls": [
+                {"url": "https://chatgpt.com/", "method": "GET", "must_contain": "ChatGPT"},
+            ],
+        },
+        {
+            "id": "netology",
+            "name": "Netology",
+            "probe_urls": [
+                {"url": "https://netology.ru/", "method": "GET"},
+            ],
+        },
+        {
+            "id": "github",
+            "name": "GitHub",
+            "probe_urls": [
+                {"url": "https://github.com/", "method": "GET", "must_contain": "GitHub"},
+            ],
+        },
     ],
     "country_lookup_no_cache": True,
     "tray_icon_tooltip": "Internet Checker",
@@ -89,12 +134,19 @@ DEFAULT_CONFIG = {
 }
 
 
+@dataclass(frozen=True)
+class ServiceStatus:
+    service_id: str
+    name: str
+    online: Optional[bool]
+
+
 @dataclass
 class NetworkState:
     online: bool
     country_name: Optional[str]
     country_code: Optional[str]
-    chatgpt_online: Optional[bool]
+    service_statuses: tuple[ServiceStatus, ...]
     checked_at: datetime
 
 
@@ -109,7 +161,7 @@ class NotificationEvent:
 class DebounceUpdate:
     online_changed: bool
     country_changed: bool
-    chatgpt_changed: bool
+    services_changed: bool
 
 
 @dataclass(frozen=True)
@@ -126,10 +178,17 @@ class SingleInstance:
     def __init__(self, mutex_name: str):
         self._mutex_name = mutex_name
         self._handle: Optional[int] = None
+        self._lock_file = None
+        self._lock_path: Optional[Path] = None
 
     def acquire(self) -> bool:
         if self._handle is not None:
             return True
+        if self._lock_file is not None:
+            return True
+
+        if not IS_WINDOWS:
+            return self._acquire_file_lock()
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         create_mutex = kernel32.CreateMutexW
@@ -150,10 +209,72 @@ class SingleInstance:
         self._handle = handle
         return True
 
+    def _acquire_file_lock(self) -> bool:
+        import fcntl
+
+        safe_name = "".join(char if char.isalnum() else "-" for char in self._mutex_name).strip("-")
+        if not safe_name:
+            safe_name = "internet-checker"
+        self._lock_path = Path(tempfile.gettempdir()) / f"{safe_name.casefold()}.lock"
+        self._lock_file = self._lock_path.open("w", encoding="utf-8")
+        try:
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self._lock_file.close()
+            self._lock_file = None
+            return False
+
+        self._lock_file.write(str(os.getpid()))
+        self._lock_file.flush()
+        return True
+
     def release(self) -> None:
         if self._handle is not None:
             ctypes.windll.kernel32.CloseHandle(self._handle)
             self._handle = None
+        if self._lock_file is not None:
+            try:
+                import fcntl
+
+                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                self._lock_file.close()
+            finally:
+                self._lock_file = None
+
+
+class ServiceDebounceState:
+    def __init__(self) -> None:
+        self.stable_online: Optional[bool] = None
+        self.success_streak = 0
+        self.fail_streak = 0
+
+    def update(self, raw_online: bool, success_required: int, fail_required: int) -> bool:
+        if raw_online:
+            self.success_streak += 1
+            self.fail_streak = 0
+        else:
+            self.fail_streak += 1
+            self.success_streak = 0
+
+        if self.stable_online is None:
+            if raw_online and self.success_streak >= success_required:
+                self.stable_online = True
+            elif not raw_online and self.fail_streak >= fail_required:
+                self.stable_online = False
+            return False
+
+        if self.stable_online and not raw_online and self.fail_streak >= fail_required:
+            self.stable_online = False
+            return True
+
+        if not self.stable_online and raw_online and self.success_streak >= success_required:
+            self.stable_online = True
+            return True
+
+        return False
 
 
 class StateDebouncer:
@@ -162,24 +283,22 @@ class StateDebouncer:
         online_success: int,
         online_fail: int,
         country_confirmations: int,
-        chatgpt_success: int,
-        chatgpt_fail: int,
+        service_success: int,
+        service_fail: int,
     ):
         self._online_success_required = max(1, int(online_success))
         self._online_fail_required = max(1, int(online_fail))
         self._country_required = max(1, int(country_confirmations))
-        self._chatgpt_success_required = max(1, int(chatgpt_success))
-        self._chatgpt_fail_required = max(1, int(chatgpt_fail))
+        self._service_success_required = max(1, int(service_success))
+        self._service_fail_required = max(1, int(service_fail))
 
         self._stable_online: Optional[bool] = None
         self._stable_country_name: Optional[str] = None
         self._stable_country_code: Optional[str] = None
-        self._stable_chatgpt_online: Optional[bool] = None
 
         self._online_success_streak = 0
         self._online_fail_streak = 0
-        self._chatgpt_success_streak = 0
-        self._chatgpt_fail_streak = 0
+        self._service_states: dict[str, ServiceDebounceState] = {}
 
         self._country_candidate_key: Optional[str] = None
         self._country_candidate_name: Optional[str] = None
@@ -202,13 +321,11 @@ class StateDebouncer:
     def stable_country_code(self) -> Optional[str]:
         return self._stable_country_code
 
-    @property
-    def stable_chatgpt_online(self) -> Optional[bool]:
-        return self._stable_chatgpt_online
-
-    @property
-    def has_stable_chatgpt(self) -> bool:
-        return self._stable_chatgpt_online is not None
+    def stable_service_online(self, service_id: str) -> Optional[bool]:
+        service_state = self._service_states.get(service_id)
+        if service_state is None:
+            return None
+        return service_state.stable_online
 
     @staticmethod
     def _country_key(country_name: Optional[str], country_code: Optional[str]) -> Optional[str]:
@@ -238,51 +355,35 @@ class StateDebouncer:
         self._country_candidate_code = None
         self._country_candidate_streak = 0
 
-    def _update_chatgpt(self, raw_chatgpt_online: bool) -> bool:
-        if raw_chatgpt_online:
-            self._chatgpt_success_streak += 1
-            self._chatgpt_fail_streak = 0
-        else:
-            self._chatgpt_fail_streak += 1
-            self._chatgpt_success_streak = 0
+    def _update_services(self, raw_service_statuses: dict[str, bool]) -> bool:
+        known_service_ids = set(raw_service_statuses)
+        for service_id in list(self._service_states):
+            if service_id not in known_service_ids:
+                del self._service_states[service_id]
 
-        if self._stable_chatgpt_online is None:
-            if raw_chatgpt_online and self._chatgpt_success_streak >= self._chatgpt_success_required:
-                self._stable_chatgpt_online = True
-            elif not raw_chatgpt_online and self._chatgpt_fail_streak >= self._chatgpt_fail_required:
-                self._stable_chatgpt_online = False
-            return False
-
-        if (
-            self._stable_chatgpt_online
-            and not raw_chatgpt_online
-            and self._chatgpt_fail_streak >= self._chatgpt_fail_required
-        ):
-            self._stable_chatgpt_online = False
-            return True
-
-        if (
-            not self._stable_chatgpt_online
-            and raw_chatgpt_online
-            and self._chatgpt_success_streak >= self._chatgpt_success_required
-        ):
-            self._stable_chatgpt_online = True
-            return True
-
-        return False
+        changed = False
+        for service_id, raw_online in raw_service_statuses.items():
+            service_state = self._service_states.setdefault(service_id, ServiceDebounceState())
+            if service_state.update(
+                raw_online,
+                self._service_success_required,
+                self._service_fail_required,
+            ):
+                changed = True
+        return changed
 
     def update(
         self,
         raw_online: bool,
         raw_country_name: Optional[str],
         raw_country_code: Optional[str],
-        raw_chatgpt_online: bool,
+        raw_service_statuses: dict[str, bool],
     ) -> DebounceUpdate:
         raw_country_name, raw_country_code = self._normalize_country(raw_country_name, raw_country_code)
 
         online_changed = False
         country_changed = False
-        chatgpt_changed = self._update_chatgpt(raw_chatgpt_online)
+        services_changed = self._update_services(raw_service_statuses)
 
         if raw_online:
             self._online_success_streak += 1
@@ -300,7 +401,7 @@ class StateDebouncer:
                 return DebounceUpdate(
                     online_changed=False,
                     country_changed=False,
-                    chatgpt_changed=chatgpt_changed,
+                    services_changed=services_changed,
                 )
         elif self._stable_online and not raw_online and self._online_fail_streak >= self._online_fail_required:
             self._stable_online = False
@@ -316,7 +417,7 @@ class StateDebouncer:
             return DebounceUpdate(
                 online_changed=online_changed,
                 country_changed=False,
-                chatgpt_changed=chatgpt_changed,
+                services_changed=services_changed,
             )
 
         raw_key = self._country_key(raw_country_name, raw_country_code)
@@ -327,7 +428,7 @@ class StateDebouncer:
             return DebounceUpdate(
                 online_changed=online_changed,
                 country_changed=False,
-                chatgpt_changed=chatgpt_changed,
+                services_changed=services_changed,
             )
 
         if stable_key is None:
@@ -337,7 +438,7 @@ class StateDebouncer:
             return DebounceUpdate(
                 online_changed=online_changed,
                 country_changed=False,
-                chatgpt_changed=chatgpt_changed,
+                services_changed=services_changed,
             )
 
         if raw_key == stable_key:
@@ -349,7 +450,7 @@ class StateDebouncer:
             return DebounceUpdate(
                 online_changed=online_changed,
                 country_changed=False,
-                chatgpt_changed=chatgpt_changed,
+                services_changed=services_changed,
             )
 
         if raw_key == self._country_candidate_key:
@@ -369,7 +470,7 @@ class StateDebouncer:
         return DebounceUpdate(
             online_changed=online_changed,
             country_changed=country_changed,
-            chatgpt_changed=chatgpt_changed,
+            services_changed=services_changed,
         )
 
 
@@ -480,14 +581,110 @@ def normalize_probe_urls(value: object, default: list[dict[str, str]], default_m
     return probes or copy.deepcopy(default)
 
 
+def service_name_from_url(url: str) -> str:
+    host = urlparse(url).hostname or url
+    return host.removeprefix("www.") or "Service"
+
+
+def sanitize_service_id(value: str, fallback: str) -> str:
+    source = value.strip().casefold() if isinstance(value, str) else ""
+    if not source:
+        source = fallback
+
+    chars: list[str] = []
+    previous_dash = False
+    for char in source:
+        if char.isalnum():
+            chars.append(char)
+            previous_dash = False
+        elif not previous_dash:
+            chars.append("-")
+            previous_dash = True
+
+    service_id = "".join(chars).strip("-")
+    return service_id or fallback
+
+
+def normalize_service_checks(value: object, default: list[dict]) -> list[dict]:
+    if isinstance(value, (str, dict)):
+        value = [value]
+    if not isinstance(value, list):
+        value = []
+
+    services: list[dict] = []
+    used_ids: set[str] = set()
+
+    for index, item in enumerate(value):
+        service_id = ""
+        service_name = ""
+        probe_value: object = []
+
+        if isinstance(item, str):
+            url = item.strip()
+            if not url:
+                continue
+            service_name = service_name_from_url(url)
+            probe_value = [url]
+        elif isinstance(item, dict):
+            raw_id = item.get("id")
+            service_id = raw_id.strip() if isinstance(raw_id, str) else ""
+
+            raw_name = item.get("name") or item.get("title")
+            service_name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else ""
+
+            if "probe_urls" in item:
+                probe_value = item.get("probe_urls")
+            elif "probes" in item:
+                probe_value = item.get("probes")
+            elif "urls" in item:
+                probe_value = item.get("urls")
+            elif isinstance(item.get("url"), str):
+                probe = {"url": item["url"]}
+                for key in ("method", "must_contain"):
+                    if isinstance(item.get(key), str):
+                        probe[key] = item[key]
+                probe_value = [probe]
+            else:
+                probe_value = []
+        else:
+            continue
+
+        probes = normalize_probe_urls(probe_value, default=[], default_method="GET")
+        if not probes:
+            continue
+
+        if not service_name:
+            service_name = service_name_from_url(probes[0]["url"])
+
+        base_id = sanitize_service_id(service_id or service_name, fallback=f"service-{index + 1}")
+        unique_id = base_id
+        suffix = 2
+        while unique_id in used_ids:
+            unique_id = f"{base_id}-{suffix}"
+            suffix += 1
+        used_ids.add(unique_id)
+
+        services.append(
+            {
+                "id": unique_id,
+                "name": service_name,
+                "probe_urls": probes,
+            }
+        )
+
+    return services or copy.deepcopy(default)
+
+
 def load_config(path: Path) -> dict:
     config = copy.deepcopy(DEFAULT_CONFIG)
+    custom_config: dict = {}
 
     if path.exists():
         with path.open("r", encoding="utf-8") as file:
             custom = json.load(file)
         if not isinstance(custom, dict):
             raise ValueError("Config must be a JSON object.")
+        custom_config = custom
         config.update(custom)
 
     merged_cooldowns = dict(DEFAULT_CONFIG["notification_cooldowns_seconds"])
@@ -528,24 +725,53 @@ def load_config(path: Path) -> dict:
         if isinstance(item, str) and item.strip()
     ]
     config["connectivity_urls"] = clean_connectivity_urls or list(DEFAULT_CONFIG["connectivity_urls"])
-    config["chatgpt_probe_urls"] = normalize_probe_urls(
-        config.get("chatgpt_probe_urls"),
-        default=DEFAULT_CONFIG["chatgpt_probe_urls"],
-        default_method="HEAD",
+
+    service_checks = normalize_service_checks(
+        config.get("service_checks"),
+        default=DEFAULT_CONFIG["service_checks"],
     )
+    if "chatgpt_probe_urls" in config:
+        legacy_chatgpt_probes = normalize_probe_urls(
+            config.get("chatgpt_probe_urls"),
+            default=[],
+            default_method="GET",
+        )
+        if legacy_chatgpt_probes:
+            chatgpt_service_found = False
+            for service in service_checks:
+                if service["id"] == "chatgpt":
+                    service["probe_urls"] = legacy_chatgpt_probes
+                    chatgpt_service_found = True
+                    break
+            if not chatgpt_service_found:
+                service_checks.insert(
+                    0,
+                    {
+                        "id": "chatgpt",
+                        "name": "ChatGPT",
+                        "probe_urls": legacy_chatgpt_probes,
+                    },
+                )
+    config["service_checks"] = service_checks
 
     config["check_interval_seconds"] = max(1, int(config["check_interval_seconds"]))
     config["request_timeout_seconds"] = max(0.2, float(config["request_timeout_seconds"]))
-    config["chatgpt_request_timeout_seconds"] = max(
-        config["request_timeout_seconds"],
-        float(config.get("chatgpt_request_timeout_seconds", config["request_timeout_seconds"])),
-    )
+    service_timeout = config["service_request_timeout_seconds"]
+    if "service_request_timeout_seconds" not in custom_config and "chatgpt_request_timeout_seconds" in custom_config:
+        service_timeout = config["chatgpt_request_timeout_seconds"]
+    config["service_request_timeout_seconds"] = max(config["request_timeout_seconds"], float(service_timeout))
     config["connectivity_attempts"] = max(1, int(config.get("connectivity_attempts", 1)))
     config["connectivity_success_confirmations"] = max(1, int(config["connectivity_success_confirmations"]))
     config["connectivity_fail_confirmations"] = max(1, int(config["connectivity_fail_confirmations"]))
     config["country_confirmations"] = max(1, int(config["country_confirmations"]))
-    config["chatgpt_success_confirmations"] = max(1, int(config["chatgpt_success_confirmations"]))
-    config["chatgpt_fail_confirmations"] = max(1, int(config["chatgpt_fail_confirmations"]))
+    service_success_confirmations = config["service_success_confirmations"]
+    if "service_success_confirmations" not in custom_config and "chatgpt_success_confirmations" in custom_config:
+        service_success_confirmations = config["chatgpt_success_confirmations"]
+    service_fail_confirmations = config["service_fail_confirmations"]
+    if "service_fail_confirmations" not in custom_config and "chatgpt_fail_confirmations" in custom_config:
+        service_fail_confirmations = config["chatgpt_fail_confirmations"]
+    config["service_success_confirmations"] = max(1, int(service_success_confirmations))
+    config["service_fail_confirmations"] = max(1, int(service_fail_confirmations))
     config["dedup_window_seconds"] = max(0, int(config["dedup_window_seconds"]))
     config["log_max_bytes"] = max(1024, int(config["log_max_bytes"]))
     config["log_backup_count"] = max(1, int(config["log_backup_count"]))
@@ -589,7 +815,10 @@ def load_config(path: Path) -> dict:
     ] or ["russia", "Russia", "RUSSIA", "russian federation", "россия", "российская федерация"]
 
     config["country_lookup_no_cache"] = bool(config.get("country_lookup_no_cache", True))
-    config["notify_on_chatgpt_status_change"] = bool(config.get("notify_on_chatgpt_status_change", True))
+    notify_on_service_status_change = config["notify_on_service_status_change"]
+    if "notify_on_service_status_change" not in custom_config and "notify_on_chatgpt_status_change" in custom_config:
+        notify_on_service_status_change = config["notify_on_chatgpt_status_change"]
+    config["notify_on_service_status_change"] = bool(notify_on_service_status_change)
 
     return config
 
@@ -602,16 +831,25 @@ def get_app_base_dir() -> Path:
 
 
 def get_fallback_data_dir() -> Path:
-    local_appdata = os.environ.get("LOCALAPPDATA")
-    if local_appdata:
-        fallback = Path(local_appdata) / "InternetChecker"
+    if IS_WINDOWS:
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            fallback = Path(local_appdata) / "InternetChecker"
+        else:
+            fallback = Path.home() / "AppData" / "Local" / "InternetChecker"
+    elif IS_MACOS:
+        fallback = Path.home() / "Library" / "Application Support" / "InternetChecker"
     else:
-        fallback = Path.home() / "AppData" / "Local" / "InternetChecker"
+        xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+        fallback = Path(xdg_config_home) / "internet-checker" if xdg_config_home else Path.home() / ".config" / "internet-checker"
     fallback.mkdir(parents=True, exist_ok=True)
     return fallback
 
 
 def is_startup_dir(path: Path) -> bool:
+    if not IS_WINDOWS:
+        return False
+
     startup_candidates: list[Path] = []
 
     appdata = os.environ.get("APPDATA")
@@ -785,10 +1023,10 @@ def response_contains_marker(response: requests.Response, marker: str, max_bytes
     return False
 
 
-def check_chatgpt_probe(probe: dict[str, str], timeout_seconds: float) -> tuple[bool, str]:
+def check_service_probe(probe: dict[str, str], timeout_seconds: float) -> tuple[bool, str]:
     url = probe.get("url", "").strip()
     if not url:
-        return False, "empty ChatGPT probe URL"
+        return False, "empty service probe URL"
 
     method = probe.get("method", "GET").strip().upper()
     if method == "TCP":
@@ -973,16 +1211,16 @@ def fetch_country(
     return None, None, None
 
 
-def check_chatgpt(probes: list[dict[str, str]], timeout_seconds: float) -> bool:
+def check_service(probes: list[dict[str, str]], timeout_seconds: float) -> bool:
     if not probes:
         return False
 
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=min(len(probes), 4),
-        thread_name_prefix="chatgpt-probe",
+        thread_name_prefix="service-probe",
     )
     futures = [
-        executor.submit(check_chatgpt_probe, probe, timeout_seconds)
+        executor.submit(check_service_probe, probe, timeout_seconds)
         for probe in probes
         if probe.get("url")
     ]
@@ -1001,17 +1239,63 @@ def check_chatgpt(probes: list[dict[str, str]], timeout_seconds: float) -> bool:
     return False
 
 
+def check_services(service_checks: list[dict], timeout_seconds: float, logger: logging.Logger) -> dict[str, bool]:
+    if not service_checks:
+        return {}
+
+    results = {service["id"]: False for service in service_checks}
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(len(service_checks), 6),
+        thread_name_prefix="service-check",
+    )
+    future_map = {
+        executor.submit(check_service, service["probe_urls"], timeout_seconds): service
+        for service in service_checks
+    }
+
+    try:
+        for future in concurrent.futures.as_completed(future_map, timeout=float(timeout_seconds) + 0.75):
+            service = future_map[future]
+            try:
+                results[service["id"]] = bool(future.result())
+            except Exception as exc:
+                logger.info("%s service check failed: %s", service["name"], exc)
+    except concurrent.futures.TimeoutError:
+        logger.info("Service checks timed out after %.1fs", float(timeout_seconds) + 0.75)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    return results
+
+
+def offline_services(state: NetworkState) -> list[ServiceStatus]:
+    if not state.online:
+        return []
+    return [service for service in state.service_statuses if service.online is False]
+
+
+def service_summary(state: NetworkState) -> str:
+    unavailable = offline_services(state)
+    if unavailable:
+        names = ", ".join(service.name for service in unavailable)
+        return f"Unavailable: {names}"
+    if any(service.online is None for service in state.service_statuses):
+        return "Services: CHECKING"
+    return "Services: ONLINE"
+
+
+def service_status_map(state: NetworkState) -> dict[str, ServiceStatus]:
+    return {service.service_id: service for service in state.service_statuses}
+
+
 def snapshot_text(state: NetworkState) -> str:
     country = state.country_name or state.country_code or "Unknown"
-    if state.online and state.chatgpt_online is True and country != "Unknown":
-        return f"ONLINE | {country}"
     if not state.online:
-        return f"Internet: OFFLINE | ChatGPT: {format_chatgpt_status(state.chatgpt_online)}"
-    chatgpt = format_chatgpt_status(state.chatgpt_online)
-    return f"Internet: ONLINE | {country} | ChatGPT: {chatgpt}"
+        return "Internet: OFFLINE"
+    return f"Internet: ONLINE | {country} | {service_summary(state)}"
 
 
-def format_chatgpt_status(value: Optional[bool]) -> str:
+def format_service_status(value: Optional[bool]) -> str:
     if value is None:
         return "UNKNOWN"
     return "ONLINE" if value else "OFFLINE"
@@ -1044,7 +1328,7 @@ def collect_events(
     current: NetworkState,
     notify_on_start: bool,
     notify_only_russia_transitions: bool,
-    notify_on_chatgpt_status_change: bool,
+    notify_on_service_status_change: bool,
     russia_codes: set[str],
     russia_names: set[str],
 ) -> list[NotificationEvent]:
@@ -1062,21 +1346,6 @@ def collect_events(
 
     events: list[NotificationEvent] = []
 
-    if (
-        notify_on_chatgpt_status_change
-        and prev.chatgpt_online is not None
-        and current.chatgpt_online is not None
-        and prev.chatgpt_online != current.chatgpt_online
-    ):
-        status = format_chatgpt_status(current.chatgpt_online)
-        events.append(
-            NotificationEvent(
-                event_type="chatgpt_status",
-                message=f"ChatGPT connection changed: {status}",
-                fingerprint=f"chatgpt_status:{status}",
-            )
-        )
-
     if prev.online != current.online:
         if not notify_only_russia_transitions:
             status = "ONLINE" if current.online else "OFFLINE"
@@ -1087,7 +1356,25 @@ def collect_events(
                     fingerprint=f"internet_status:{status}",
                 )
             )
-        return events
+        if not current.online:
+            return events
+
+    if notify_on_service_status_change and current.online:
+        prev_services = service_status_map(prev)
+        for service in current.service_statuses:
+            previous_service = prev_services.get(service.service_id)
+            if service.online is False and (
+                previous_service is None
+                or previous_service.online is not False
+                or not prev.online
+            ):
+                events.append(
+                    NotificationEvent(
+                        event_type="service_status",
+                        message=f"Service unavailable: {service.name}",
+                        fingerprint=f"service_status:{service.service_id}:offline",
+                    )
+                )
 
     prev_country_key = prev.country_code or prev.country_name
     current_country_key = current.country_code or current.country_name
@@ -1115,11 +1402,61 @@ def collect_events(
     return events
 
 
-def notify(toaster: WindowsToaster, title: str, message: str, duration_seconds: int) -> None:
-    toast = Toast()
-    toast.duration = ToastDuration.Short if duration_seconds <= 7 else ToastDuration.Long
-    toast.text_fields = [title, message]
-    toaster.show_toast(toast)
+class Notifier:
+    def __init__(self, app_name: str) -> None:
+        self._app_name = app_name
+        self._windows_toaster = WindowsToaster(app_name) if IS_WINDOWS and WindowsToaster is not None else None
+
+    def show(self, title: str, message: str, duration_seconds: int) -> None:
+        if self._windows_toaster is not None and Toast is not None and ToastDuration is not None:
+            toast = Toast()
+            toast.duration = ToastDuration.Short if duration_seconds <= 7 else ToastDuration.Long
+            toast.text_fields = [title, message]
+            self._windows_toaster.show_toast(toast)
+            return
+
+        if shutil.which("notify-send"):
+            subprocess.run(
+                [
+                    "notify-send",
+                    "--app-name",
+                    self._app_name,
+                    "--expire-time",
+                    str(max(1, int(duration_seconds)) * 1000),
+                    title,
+                    message,
+                ],
+                check=False,
+                timeout=3,
+            )
+            return
+
+        if IS_MACOS and shutil.which("osascript"):
+            script = (
+                f'display notification {json.dumps(message)} '
+                f'with title {json.dumps(title)}'
+            )
+            subprocess.run(["osascript", "-e", script], check=False, timeout=3)
+
+
+def notify(notifier: Notifier, title: str, message: str, duration_seconds: int) -> None:
+    notifier.show(title, message, duration_seconds)
+
+
+def open_path(path: Path) -> None:
+    if IS_WINDOWS:
+        os.startfile(str(path))
+        return
+
+    if IS_MACOS and shutil.which("open"):
+        subprocess.Popen(["open", str(path)])
+        return
+
+    if shutil.which("xdg-open"):
+        subprocess.Popen(["xdg-open", str(path)])
+        return
+
+    raise RuntimeError("No supported file opener found.")
 
 
 def create_tray_image() -> Image.Image:
@@ -1304,9 +1641,7 @@ class TrayPopupController:
         else:
             message = "No data yet."
         try:
-            toast = Toast()
-            toast.text_fields = ["Internet Checker", message]
-            WindowsToaster("Internet Checker").show_toast(toast)
+            Notifier("Internet Checker").show("Internet Checker", message, int(self._config["toast_duration_seconds"]))
         except Exception as exc:
             self._logger.info("Tray status notification failed: %s", exc)
 
@@ -1322,7 +1657,7 @@ class TrayPopupController:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             if not log_path.exists():
                 log_path.touch()
-            os.startfile(str(log_path))
+            open_path(log_path)
         except Exception as exc:
             self._logger.info("Opening log file failed: %s", exc)
 
@@ -1332,7 +1667,10 @@ class TrayPopupController:
         self._hide_popup()
 
 
-class ClickMenuIcon(Icon):
+_TrayIconBase = Icon if Icon is not None else object
+
+
+class ClickMenuIcon(_TrayIconBase):
     def __init__(self, *args, popup_controller: TrayPopupController, **kwargs):
         self._popup_controller = popup_controller
         super().__init__(*args, **kwargs)
@@ -1355,17 +1693,22 @@ def tray_status_lines(snapshot: StatusSnapshot) -> list[str]:
     internet = "ONLINE" if state.online else "OFFLINE"
     country = state.country_name or state.country_code or "Unknown"
     checked_at = state.checked_at.strftime("%H:%M:%S")
-    if state.online and state.chatgpt_online is True and country != "Unknown":
+    unavailable = offline_services(state)
+    if state.online and not unavailable and country != "Unknown":
         lines = [
             "ONLINE",
             country,
+            "Сервисы: ONLINE",
         ]
     else:
         lines = [
             f"Интернет: {internet}",
             country,
-            f"ChatGPT: {format_chatgpt_status(state.chatgpt_online)}",
         ]
+        if state.online and unavailable:
+            lines.append("Нет доступа: " + ", ".join(service.name for service in unavailable))
+        elif state.online:
+            lines.append("Сервисы: ONLINE")
     lines.append(f"Обновлено: {checked_at}")
     if snapshot.checking:
         lines.append("Проверка: выполняется")
@@ -1378,10 +1721,21 @@ def tray_tooltip(base_title: str, snapshot: StatusSnapshot) -> str:
     state = snapshot.state
     internet = "ONLINE" if state.online else "OFFLINE"
     country = state.country_name or state.country_code or "Unknown"
-    if state.online and state.chatgpt_online is True and country != "Unknown":
-        return f"{base_title} - ONLINE, {country}"
-    chatgpt = format_chatgpt_status(state.chatgpt_online)
-    return f"{base_title} - Internet {internet}, ChatGPT {chatgpt}, {country}"
+    unavailable = offline_services(state)
+    if state.online and unavailable:
+        names = ", ".join(service.name for service in unavailable)
+        return f"{base_title} - Internet {internet}, unavailable: {names}, {country}"
+    if state.online and country != "Unknown":
+        return f"{base_title} - ONLINE, {country}, services ONLINE"
+    return f"{base_title} - Internet {internet}, {country}"
+
+
+def tray_supported() -> bool:
+    if Icon is None or tk is None:
+        return False
+    if not IS_WINDOWS and not IS_MACOS and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    return True
 
 
 def wait_for_next_cycle(
@@ -1409,14 +1763,14 @@ def run_cycle_checks(
     config: dict,
     logger: logging.Logger,
     country_urls: list[str],
-) -> tuple[bool, Optional[str], Optional[str], Optional[str], bool]:
+) -> tuple[bool, Optional[str], Optional[str], Optional[str], dict[str, bool]]:
     timeout = float(config["request_timeout_seconds"])
-    chatgpt_timeout = float(config["chatgpt_request_timeout_seconds"])
-    overall_timeout = max(1.0, timeout + 1.0, chatgpt_timeout + 0.75)
+    service_timeout = float(config["service_request_timeout_seconds"])
+    overall_timeout = max(1.0, timeout + 1.0, service_timeout + 0.75)
     defaults = {
         "online": False,
         "country": (None, None, None),
-        "chatgpt": False,
+        "services": {service["id"]: False for service in config["service_checks"]},
     }
     results = dict(defaults)
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="monitor-cycle")
@@ -1435,10 +1789,11 @@ def run_cycle_checks(
             no_cache=bool(config.get("country_lookup_no_cache", True)),
         ): ("country", "Country lookup"),
         executor.submit(
-            check_chatgpt,
-            probes=config["chatgpt_probe_urls"],
-            timeout_seconds=chatgpt_timeout,
-        ): ("chatgpt", "ChatGPT check"),
+            check_services,
+            service_checks=config["service_checks"],
+            timeout_seconds=service_timeout,
+            logger=logger,
+        ): ("services", "Service checks"),
     }
 
     try:
@@ -1455,10 +1810,10 @@ def run_cycle_checks(
 
     raw_country_name, raw_country_code, country_source = results["country"]
     raw_connectivity_online = bool(results["online"])
-    raw_chatgpt_online = bool(results["chatgpt"])
-    raw_online = raw_connectivity_online or raw_chatgpt_online or bool(raw_country_name or raw_country_code)
+    raw_service_statuses = dict(results["services"])
+    raw_online = raw_connectivity_online or any(raw_service_statuses.values()) or bool(raw_country_name or raw_country_code)
 
-    return raw_online, raw_country_name, raw_country_code, country_source, raw_chatgpt_online
+    return raw_online, raw_country_name, raw_country_code, country_source, raw_service_statuses
 
 
 def run_monitor_loop(
@@ -1469,13 +1824,13 @@ def run_monitor_loop(
     status_store: StatusStore,
     check_now_event: Optional[threading.Event],
 ) -> None:
-    toaster = WindowsToaster("Internet Checker")
+    notifier = Notifier("Internet Checker")
     debouncer = StateDebouncer(
         online_success=int(config["connectivity_success_confirmations"]),
         online_fail=int(config["connectivity_fail_confirmations"]),
         country_confirmations=int(config["country_confirmations"]),
-        chatgpt_success=int(config["chatgpt_success_confirmations"]),
-        chatgpt_fail=int(config["chatgpt_fail_confirmations"]),
+        service_success=int(config["service_success_confirmations"]),
+        service_fail=int(config["service_fail_confirmations"]),
     )
     notification_policy = NotificationPolicy(
         cooldowns=config["notification_cooldowns_seconds"],
@@ -1489,7 +1844,7 @@ def run_monitor_loop(
     if bool(config.get("show_app_started_notification", True)):
         try:
             notify(
-                toaster=toaster,
+                notifier=notifier,
                 title=str(config["app_started_title"]),
                 message=str(config["app_started_message"]),
                 duration_seconds=int(config["toast_duration_seconds"]),
@@ -1502,7 +1857,6 @@ def run_monitor_loop(
         while not stop_event.is_set():
             now = datetime.now()
             now_ts = time.time()
-            timeout = float(config["request_timeout_seconds"])
             if check_now_event is not None:
                 check_now_event.clear()
             status_store.set_checking(True)
@@ -1511,7 +1865,7 @@ def run_monitor_loop(
             if last_country_source and last_country_source in country_urls:
                 country_urls = [last_country_source] + [url for url in country_urls if url != last_country_source]
 
-            raw_online, raw_country_name, raw_country_code, country_source, raw_chatgpt_online = run_cycle_checks(
+            raw_online, raw_country_name, raw_country_code, country_source, raw_service_statuses = run_cycle_checks(
                 config=config,
                 logger=logger,
                 country_urls=country_urls,
@@ -1525,7 +1879,7 @@ def run_monitor_loop(
                 raw_online,
                 raw_country_name,
                 raw_country_code,
-                raw_chatgpt_online,
+                raw_service_statuses,
             )
             if not debouncer.has_stable_online:
                 logger.info("No notification. State: warming up connectivity checks.")
@@ -1535,11 +1889,19 @@ def run_monitor_loop(
                 wait_for_next_cycle(stop_event, check_now_event, int(config["check_interval_seconds"]))
                 continue
 
+            service_statuses = tuple(
+                ServiceStatus(
+                    service_id=service["id"],
+                    name=service["name"],
+                    online=debouncer.stable_service_online(service["id"]),
+                )
+                for service in config["service_checks"]
+            )
             current_state = NetworkState(
                 online=debouncer.stable_online,
                 country_name=debouncer.stable_country_name if debouncer.stable_online else None,
                 country_code=debouncer.stable_country_code if debouncer.stable_online else None,
-                chatgpt_online=debouncer.stable_chatgpt_online if debouncer.has_stable_chatgpt else None,
+                service_statuses=service_statuses,
                 checked_at=now,
             )
             status_store.set_state(current_state)
@@ -1549,7 +1911,7 @@ def run_monitor_loop(
                 current=current_state,
                 notify_on_start=bool(config["notify_on_start"]),
                 notify_only_russia_transitions=bool(config["notify_only_russia_transitions"]),
-                notify_on_chatgpt_status_change=bool(config.get("notify_on_chatgpt_status_change", True)),
+                notify_on_service_status_change=bool(config.get("notify_on_service_status_change", True)),
                 russia_codes=set(config["russia_country_codes"]),
                 russia_names=set(config["russia_country_names"]),
             )
@@ -1571,7 +1933,7 @@ def run_monitor_loop(
                 message = "\n".join(approved_messages)
                 try:
                     notify(
-                        toaster=toaster,
+                        notifier=notifier,
                         title="Internet Checker",
                         message=message,
                         duration_seconds=int(config["toast_duration_seconds"]),
@@ -1645,7 +2007,7 @@ def run_with_tray(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Internet and VPN country monitor for Windows notifications.")
+    parser = argparse.ArgumentParser(description="Internet, country, and service availability monitor.")
     parser.add_argument(
         "--config",
         default="config.json",
@@ -1715,6 +2077,16 @@ def main() -> None:
                 logger=logger,
                 stop_event=stop_event,
                 run_once=args.once,
+                status_store=status_store,
+                check_now_event=check_now_event,
+            )
+        elif not tray_supported():
+            logger.warning("Tray UI is unavailable on this platform/session. Running without tray.")
+            run_monitor_loop(
+                config=config,
+                logger=logger,
+                stop_event=stop_event,
+                run_once=False,
                 status_store=status_store,
                 check_now_event=check_now_event,
             )
