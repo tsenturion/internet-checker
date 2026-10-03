@@ -50,6 +50,15 @@ class MonitorStatesTest(unittest.TestCase):
                     )
                     self.assertIs(grouped[0].online, expected)
                     self.assertEqual(grouped[1].service_id, "openai-api")
+                    state = make_state(services=grouped)
+                    lines = main.tray_status_lines(main.StatusSnapshot(state, False, None, None))
+                    tooltip = main.tray_tooltip("Internet Checker", main.StatusSnapshot(state, False, None, None))
+                    self.assertNotIn("ONLINE", " | ".join(lines) + tooltip)
+                    self.assertNotIn("UNKNOWN", " | ".join(lines) + tooltip)
+                    self.assertEqual(any(line.startswith("ChatGPT:") for line in lines), expected is False)
+                    self.assertIn("OpenAI API: OFFLINE", lines)
+                    healthy = make_state(services=[main.ServiceStatus("telegram", "Telegram Desktop", True)])
+                    self.assertEqual(main.snapshot_text(healthy), "Italy")
 
     def test_api_failure_has_no_notification(self):
         previous = make_state(services=[main.ServiceStatus("openai-api", "OpenAI API", True)])

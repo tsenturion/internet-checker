@@ -1508,14 +1508,15 @@ def group_service_statuses(statuses: tuple[ServiceStatus, ...]) -> tuple[Service
 def service_status_text(service: ServiceStatus) -> str:
     if service.detail:
         return f"{service.name}: {service.detail}"
-    if service.components and not all(online is True for _name, online in service.components):
-        parts = ", ".join(f"{name} {format_service_status(online)}" for name, online in service.components)
+    if service.components and service.online is False:
+        parts = ", ".join(f"{name} OFFLINE" for name, online in service.components if online is False)
         return f"{service.name}: {parts}"
     return f"{service.name}: {format_service_status(service.online)}"
 
 
 def service_summary(state: NetworkState) -> str:
-    return " | ".join(service_status_text(service) for service in group_service_statuses(state.service_statuses))
+    return " | ".join(service_status_text(service) for service in group_service_statuses(state.service_statuses)
+                      if service.online is False)
 
 
 def service_status_map(state: NetworkState) -> dict[str, ServiceStatus]:
@@ -1524,7 +1525,8 @@ def service_status_map(state: NetworkState) -> dict[str, ServiceStatus]:
 
 def snapshot_text(state: NetworkState) -> str:
     connection = (state.country_name or state.country_code or "Страна неизвестна") if state.online else "Нет интернета"
-    return f"{connection} | {service_summary(state)}"
+    services = service_summary(state)
+    return f"{connection} | {services}" if services else connection
 
 
 def format_service_status(value: Optional[bool]) -> str:
@@ -1900,7 +1902,8 @@ def tray_status_lines(snapshot: StatusSnapshot) -> list[str]:
     state = snapshot.state
     checked_at = state.checked_at.strftime("%H:%M:%S")
     lines = [(state.country_name or state.country_code or "Страна неизвестна") if state.online else "Нет интернета"]
-    lines.extend(service_status_text(service) for service in group_service_statuses(state.service_statuses))
+    lines.extend(service_status_text(service) for service in group_service_statuses(state.service_statuses)
+                 if service.online is False)
     lines.append(f"Обновлено: {checked_at}")
     if snapshot.checking:
         lines.append("Проверка: выполняется")

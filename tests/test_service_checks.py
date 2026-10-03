@@ -128,12 +128,15 @@ class ServiceChecksTest(unittest.TestCase):
         state = main.NetworkState(True, "Italy", "IT", (
             main.ServiceStatus("chatgpt", "ChatGPT", True),
             main.ServiceStatus("chatgpt-init", "ab.chatgpt.com", False),
+            main.ServiceStatus("telegram", "Telegram Desktop", True),
+            main.ServiceStatus("openai-api", "OpenAI API", None, detail="ключ не указан", notify=False),
         ), datetime.now())
         lines = main.tray_status_lines(main.StatusSnapshot(state, False, state.checked_at, None))
-        self.assertIn("ChatGPT: сайт ONLINE, ab.chatgpt.com OFFLINE", lines)
+        self.assertIn("ChatGPT: ab.chatgpt.com OFFLINE", lines)
         self.assertFalse(any(line.startswith("ab.chatgpt.com:") for line in lines))
+        self.assertFalse(any(line.startswith(("Telegram Desktop:", "OpenAI API:")) for line in lines))
         self.assertEqual(lines[0], "Italy")
-        self.assertNotIn("ONLINE", lines)
+        self.assertNotIn("ONLINE", " | ".join(lines))
 
     def test_connectivity_rejects_portal_redirect_and_block(self):
         for path in ("/portal", "/redirect", "/blocked"):
