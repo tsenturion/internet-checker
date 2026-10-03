@@ -1,6 +1,7 @@
 param(
     [string]$SourceExe = ".\dist\InternetChecker.exe",
     [string]$StartupExeName = "InternetChecker.exe",
+    [string]$SourceEnvFile = ".\.env",
     [switch]$StartAfterInstall = $true
 )
 
@@ -36,6 +37,13 @@ Copy-Item -LiteralPath $sourcePath -Destination $targetExe -Force
 
 if (-not (Test-Path $targetExe)) {
     throw "Installed executable not found: $targetExe"
+}
+
+if (Test-Path -LiteralPath $SourceEnvFile) {
+    $dataDir = Join-Path $env:LOCALAPPDATA "InternetChecker"
+    New-Item -Path $dataDir -ItemType Directory -Force | Out-Null
+    Copy-Item -LiteralPath $SourceEnvFile -Destination (Join-Path $dataDir ".env") -Force
+    Write-Host "Настройки API скопированы в пользовательский каталог приложения."
 }
 
 if ($StartAfterInstall) {

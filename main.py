@@ -10,7 +10,7 @@ import os
 import queue
 import shutil
 import socket
-import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -21,7 +21,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
 try:
@@ -30,6 +30,8 @@ except Exception:
     tk = None
 
 import requests
+import socks
+from dotenv import load_dotenv
 from PIL import Image, ImageDraw
 try:
     from pystray import Icon
@@ -49,11 +51,12 @@ except Exception:
 
 IS_WINDOWS = sys.platform.startswith("win")
 IS_MACOS = sys.platform == "darwin"
+OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
 
 
 DEFAULT_CONFIG = {
     "check_interval_seconds": 5,
-    "request_timeout_seconds": 1.5,
+    "request_timeout_seconds": 3.0,
     "service_request_timeout_seconds": 8.0,
     "connectivity_success_confirmations": 1,
     "connectivity_fail_confirmations": 1,
@@ -90,13 +93,11 @@ DEFAULT_CONFIG = {
     "log_to_console": True,
     "connectivity_attempts": 1,
     "connectivity_urls": [
-        "http://www.msftconnecttest.com/connecttest.txt",
-        "https://cloudflare.com/cdn-cgi/trace",
-        "https://clients3.google.com/generate_204",
-        "tcp://8.8.8.8:53",
-        "tcp://8.8.4.4:53",
-        "tcp://9.9.9.9:53",
-        "tcp://208.67.222.222:53",
+        {"url": "https://www.msftconnecttest.com/connecttest.txt", "expected_status": 200,
+         "expected_body": "Microsoft Connect Test"},
+        {"url": "https://www.cloudflare.com/cdn-cgi/trace", "expected_status": 200,
+         "must_contain": "h=www.cloudflare.com\n"},
+        {"url": "https://clients3.google.com/generate_204", "expected_status": 204},
     ],
     "country_lookup_urls": [
         "https://ipwho.is/",
@@ -107,6 +108,7 @@ DEFAULT_CONFIG = {
         {
             "id": "chatgpt",
             "name": "ChatGPT",
+            "fail_confirmations": 1,
             "probe_urls": [
                 {"url": "https://chatgpt.com/", "method": "GET", "must_contain": "ChatGPT"},
             ],
@@ -132,6 +134,26 @@ DEFAULT_CONFIG = {
                     },
                     "must_contain": '"feature_gates"',
                 },
+            ],
+        },
+        {
+            "id": "openai-api",
+            "name": "OpenAI API",
+            "notify": False,
+            "timeout_seconds": 10.0,
+            "fail_confirmations": 1,
+            "probe_urls": [
+                {"url": OPENAI_MODELS_URL, "method": "GET", "api_key_env": "OPENAI_API_KEY"},
+            ],
+        },
+        {
+            "id": "telegram",
+            "name": "Telegram Desktop",
+            "timeout_seconds": 10.0,
+            "fail_confirmations": 1,
+            "probe_urls": [
+                {"url": "mtproto://149.154.167.51:443", "method": "MTPROTO"},
+                {"url": "mtproto://149.154.167.91:443", "method": "MTPROTO"},
             ],
         },
         {
@@ -163,6 +185,9 @@ class ServiceStatus:
     service_id: str
     name: str
     online: Optional[bool]
+    components: tuple[tuple[str, Optional[bool]], ...] = ()
+    detail: str = ""
+    notify: bool = True
 
 
 @dataclass
@@ -501,11 +526,40 @@ class StateDebouncer:
 
 
 class NotificationPolicy:
-    def __init__(self, cooldowns: dict[str, int], dedup_window_seconds: int):
+    def __init__(self, cooldowns: dict[str, int], dedup_window_seconds: int, outage_state_path: Optional[Path] = None):
         self._cooldowns = {key: max(0, int(value)) for key, value in cooldowns.items()}
         self._dedup_window_seconds = max(0, int(dedup_window_seconds))
         self._last_by_type: dict[str, float] = {}
         self._last_by_fingerprint: dict[str, float] = {}
+        self._outage_state_path = outage_state_path
+        self._active_outages: set[str] = set()
+        if outage_state_path and outage_state_path.exists():
+            try:
+                saved = json.loads(outage_state_path.read_text(encoding="utf-8"))
+                self._active_outages = {item for item in saved if isinstance(item, str)}
+            except (OSError, ValueError, TypeError):
+                logging.getLogger("internet_checker").warning("Не удалось прочитать состояния уведомлений о сбоях")
+
+    def _save_outages(self) -> None:
+        if self._outage_state_path is None:
+            return
+        try:
+            self._outage_state_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._outage_state_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(sorted(self._active_outages), ensure_ascii=False), encoding="utf-8")
+            temporary.replace(self._outage_state_path)
+        except OSError:
+            logging.getLogger("internet_checker").warning("Не удалось сохранить состояния уведомлений о сбоях")
+
+    def observe_state(self, state: NetworkState) -> None:
+        before = self._active_outages.copy()
+        if state.online:
+            self._active_outages.discard("internet_status:offline")
+        for service in state.service_statuses:
+            if service.online is True or not service.notify:
+                self._active_outages.discard(f"service_status:{service.service_id}:offline")
+        if before != self._active_outages:
+            self._save_outages()
 
     def _cleanup(self, now_ts: float) -> None:
         if self._dedup_window_seconds <= 0 or len(self._last_by_fingerprint) < 500:
@@ -518,6 +572,12 @@ class NotificationPolicy:
         }
 
     def should_send(self, event: NotificationEvent, now_ts: float) -> tuple[bool, Optional[str]]:
+        if event.event_type in {"internet_status", "service_status"} and event.fingerprint.endswith(":offline"):
+            if event.fingerprint in self._active_outages:
+                return False, "сбой уже показан; ожидается восстановление"
+            self._active_outages.add(event.fingerprint)
+            self._save_outages()
+            return True, None
         cooldown_seconds = self._cooldowns.get(event.event_type, 0)
         last_type_ts = self._last_by_type.get(event.event_type)
         if last_type_ts is not None and cooldown_seconds > 0 and now_ts - last_type_ts < cooldown_seconds:
@@ -596,7 +656,7 @@ def normalize_probe_urls(value: object, default: list[dict], default_method: str
 
         if not url:
             continue
-        if method not in {"GET", "HEAD", "POST", "TCP"}:
+        if method not in {"GET", "HEAD", "POST", "MTPROTO"}:
             method = default_method
 
         probe = {"url": url, "method": method}
@@ -604,6 +664,8 @@ def normalize_probe_urls(value: object, default: list[dict], default_method: str
             probe["must_contain"] = must_contain
         if method == "POST" and isinstance(item, dict) and isinstance(item.get("json"), dict):
             probe["json"] = copy.deepcopy(item["json"])
+        if isinstance(item, dict) and item.get("api_key_env") == "OPENAI_API_KEY":
+            probe["api_key_env"] = "OPENAI_API_KEY"
         probes.append(probe)
 
     return probes or copy.deepcopy(default)
@@ -668,7 +730,7 @@ def normalize_service_checks(value: object, default: list[dict]) -> list[dict]:
                 probe_value = item.get("urls")
             elif isinstance(item.get("url"), str):
                 probe = {"url": item["url"]}
-                for key in ("method", "must_contain", "json"):
+                for key in ("method", "must_contain", "json", "api_key_env"):
                     if key in item:
                         probe[key] = copy.deepcopy(item[key])
                 probe_value = [probe]
@@ -694,6 +756,7 @@ def normalize_service_checks(value: object, default: list[dict]) -> list[dict]:
 
         service = {"id": unique_id, "name": service_name, "probe_urls": probes}
         if isinstance(item, dict):
+            service["notify"] = bool(item.get("notify", True))
             if "timeout_seconds" in item:
                 service["timeout_seconds"] = max(0.2, float(item["timeout_seconds"]))
             if "fail_confirmations" in item:
@@ -734,25 +797,19 @@ def load_config(path: Path) -> dict:
     config["country_lookup_urls"] = clean_urls or list(DEFAULT_CONFIG["country_lookup_urls"])
 
     connectivity_urls = config.get("connectivity_urls")
-    if isinstance(connectivity_urls, str):
-        connectivity_urls = [connectivity_urls]
     if not isinstance(connectivity_urls, list):
         connectivity_urls = []
-
-    legacy_connectivity_url = config.get("connectivity_url")
-    if (
-        isinstance(legacy_connectivity_url, str)
-        and legacy_connectivity_url.strip()
-        and legacy_connectivity_url not in connectivity_urls
-    ):
-        connectivity_urls.insert(0, legacy_connectivity_url)
-
     clean_connectivity_urls = [
-        item.strip()
+        copy.deepcopy(item)
         for item in connectivity_urls
-        if isinstance(item, str) and item.strip()
+        if isinstance(item, dict)
+        and isinstance(item.get("url"), str)
+        and urlparse(item["url"]).scheme == "https"
+        and isinstance(item.get("expected_status"), int)
+        and 200 <= item["expected_status"] < 300
+        and (item["expected_status"] == 204 or item.get("expected_body") or item.get("must_contain"))
     ]
-    config["connectivity_urls"] = clean_connectivity_urls or list(DEFAULT_CONFIG["connectivity_urls"])
+    config["connectivity_urls"] = clean_connectivity_urls or copy.deepcopy(DEFAULT_CONFIG["connectivity_urls"])
 
     service_checks = normalize_service_checks(
         config.get("service_checks"),
@@ -933,6 +990,7 @@ def finalize_runtime_paths(config: dict, data_dir: Path) -> dict:
     if not log_path.is_absolute():
         log_path = data_dir / log_path
     result["log_file_path"] = str(log_path)
+    result["notification_state_path"] = str(data_dir / "notification-state.json")
     return result
 
 
@@ -979,62 +1037,39 @@ def setup_logging(config: dict) -> logging.Logger:
     return logger
 
 
-def build_request_timeout(timeout_seconds: float) -> tuple[float, float]:
-    timeout = max(0.2, float(timeout_seconds))
-    return min(0.75, timeout), timeout
-
-
-def tcp_probe_url(url: str, timeout_seconds: float) -> tuple[bool, str]:
-    parsed = urlparse(url)
-    host = parsed.hostname
-    if not host:
-        return False, f"TCP {url} -> invalid URL"
-
-    scheme = parsed.scheme.lower()
-    port = parsed.port or (443 if scheme == "https" else 80)
-    use_tls = scheme == "https"
-    timeout = max(0.2, float(timeout_seconds))
-
-    raw_socket = None
+def check_connectivity_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]:
+    url = probe.get("url", "")
+    if urlparse(url).scheme not in {"http", "https"}:
+        return False, "Для проверки интернета нужен HTTP(S)-ответ"
+    if probe.get("expected_status") != 204 and not (probe.get("expected_body") or probe.get("must_contain")):
+        return False, "Не задано ожидаемое содержимое ответа проверки интернета"
+    started_at = time.monotonic()
     try:
-        raw_socket = socket.create_connection((host, port), timeout=timeout)
-        if use_tls:
-            context = ssl.create_default_context()
-            with context.wrap_socket(raw_socket, server_hostname=host):
-                raw_socket = None
-                return True, f"TCP {host}:{port} TLS -> connected"
-        raw_socket.close()
-        raw_socket = None
-        return True, f"TCP {host}:{port} -> connected"
-    except OSError as exc:
-        return False, f"TCP {host}:{port} -> {type(exc).__name__}"
-    finally:
-        if raw_socket is not None:
-            try:
-                raw_socket.close()
-            except OSError:
-                pass
-
-
-def http_probe(url: str, timeout_seconds: float, method: str = "HEAD") -> tuple[bool, str]:
-    method = method.upper()
-    if method == "TCP":
-        return tcp_probe_url(url, timeout_seconds)
-
-    try:
-        response = requests.request(
-            method=method,
-            url=url,
-            timeout=build_request_timeout(timeout_seconds),
-            allow_redirects=True,
-            headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
-        )
-        return response.status_code < 500, f"{method} {url} -> HTTP {response.status_code}"
+        with requests.get(
+            build_country_request_url(url, no_cache=True),
+            timeout=max(0.2, timeout_seconds),
+            allow_redirects=False,
+            stream=True,
+            headers={"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"},
+        ) as response:
+            if response.status_code != probe["expected_status"]:
+                return False, f"{url} -> HTTP {response.status_code} вместо {probe['expected_status']}"
+            body = bytearray()
+            for chunk in response.iter_content(chunk_size=512):
+                body.extend(chunk)
+                if len(body) > 4096 or time.monotonic() - started_at >= timeout_seconds:
+                    return False, f"{url} -> ответ слишком большой или медленный"
+            if time.monotonic() - started_at >= timeout_seconds:
+                return False, f"{url} -> превышен лимит {timeout_seconds:g} с"
+            if response.status_code == 204 and body:
+                return False, f"{url} -> непустой ответ HTTP 204"
+            if "expected_body" in probe and body.strip() != probe["expected_body"].encode("utf-8"):
+                return False, f"{url} -> подменен ожидаемый ответ"
+            if "must_contain" in probe and probe["must_contain"].encode("utf-8") not in body:
+                return False, f"{url} -> отсутствует маркер ответа"
+            return True, f"{url} -> проверен HTTP {response.status_code}"
     except requests.RequestException as exc:
-        tcp_ok, tcp_detail = tcp_probe_url(url, timeout_seconds)
-        if tcp_ok:
-            return True, tcp_detail
-        return False, f"{method} {url} -> {type(exc).__name__}; {tcp_detail}"
+        return False, f"{url} -> {type(exc).__name__}"
 
 
 def response_contains_marker(response: requests.Response, marker: str, max_bytes: int = 512_000) -> bool:
@@ -1059,14 +1094,92 @@ def response_contains_marker(response: requests.Response, marker: str, max_bytes
     return False
 
 
+def receive_mtproto_bytes(connection: socket.socket, size: int, deadline: float) -> bytes:
+    data = bytearray()
+    while len(data) < size:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Превышен лимит MTProto")
+        connection.settimeout(remaining)
+        chunk = connection.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("Сервер MTProto закрыл соединение")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def open_mtproto_connection(host: str, port: int, timeout_seconds: float) -> socket.socket:
+    request_url = f"https://{host}:{port}"
+    proxy = requests.utils.select_proxy(request_url, requests.utils.get_environ_proxies(request_url))
+    if not proxy:
+        return socket.create_connection((host, port), timeout=timeout_seconds)
+    parsed = urlparse(proxy)
+    proxy_types = {"http": socks.HTTP, "socks5": socks.SOCKS5, "socks5h": socks.SOCKS5,
+                   "socks4": socks.SOCKS4, "socks4a": socks.SOCKS4}
+    if parsed.scheme not in proxy_types or not parsed.hostname:
+        raise OSError("Схема системного прокси не поддерживается для MTProto")
+    return socks.create_connection(
+        (host, port), timeout=timeout_seconds, proxy_type=proxy_types[parsed.scheme],
+        proxy_addr=parsed.hostname, proxy_port=parsed.port or (80 if parsed.scheme == "http" else 1080),
+        proxy_rdns=parsed.scheme not in {"socks4", "socks5"},
+        proxy_username=unquote(parsed.username) if parsed.username else None,
+        proxy_password=unquote(parsed.password) if parsed.password else None,
+    )
+
+
+def check_mtproto_probe(url: str, timeout_seconds: float) -> tuple[bool, str]:
+    parsed = urlparse(url)
+    if parsed.scheme != "mtproto" or not parsed.hostname:
+        return False, "Некорректный адрес MTProto"
+    deadline = time.monotonic() + timeout_seconds
+    nonce = os.urandom(16)
+    message_id = ((time.time_ns() << 32) // 1_000_000_000) & ~3
+    request_body = struct.pack("<I", 0xBE7E8EF1) + nonce
+    payload = struct.pack("<QQI", 0, message_id, len(request_body)) + request_body
+    try:
+        with open_mtproto_connection(parsed.hostname, parsed.port or 443, timeout_seconds) as connection:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Превышен лимит MTProto")
+            connection.settimeout(remaining)
+            connection.sendall(b"\xef" + bytes([len(payload) // 4]) + payload)
+            header = receive_mtproto_bytes(connection, 1, deadline)[0]
+            if header == 0x7F:
+                size = int.from_bytes(receive_mtproto_bytes(connection, 3, deadline), "little") * 4
+            elif 0 < header < 0x7F:
+                size = header * 4
+            else:
+                return False, f"{url} -> некорректный заголовок MTProto"
+            if not 4 <= size <= 4096:
+                return False, f"{url} -> некорректный размер MTProto"
+            response = receive_mtproto_bytes(connection, size, deadline)
+            if size == 4:
+                return False, f"{url} -> ошибка транспорта MTProto {int.from_bytes(response, 'little', signed=True)}"
+            if (size < 68 or response[:8] != b"\x00" * 8
+                    or struct.unpack_from("<I", response, 16)[0] != size - 20
+                    or response[20:24] != struct.pack("<I", 0x05162463)
+                    or response[24:40] != nonce):
+                return False, f"{url} -> отсутствует корректный ответ resPQ"
+            pq_length = response[56]
+            vector_offset = ((57 + pq_length + 3) // 4) * 4
+            if not 1 <= pq_length <= 16 or vector_offset + 8 > size:
+                return False, f"{url} -> некорректная структура resPQ"
+            vector_type, key_count = struct.unpack_from("<II", response, vector_offset)
+            if vector_type != 0x1CB5C415 or not 1 <= key_count <= 64 or vector_offset + 8 + key_count * 8 != size:
+                return False, f"{url} -> неполный ответ resPQ"
+            return True, f"{url} -> получен MTProto resPQ"
+    except OSError as exc:
+        return False, f"{url} -> {type(exc).__name__}"
+
+
 def check_service_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]:
     url = probe.get("url", "").strip()
     if not url:
         return False, "empty service probe URL"
 
     method = probe.get("method", "GET").strip().upper()
-    if method == "TCP":
-        method = "GET"
+    if method == "MTPROTO":
+        return check_mtproto_probe(url, timeout_seconds)
     if method not in {"GET", "HEAD", "POST"}:
         method = "GET"
 
@@ -1084,27 +1197,37 @@ def check_service_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]
             "Chrome/126.0 Safari/537.36"
         ),
     }
+    is_api_check = probe.get("api_key_env") == "OPENAI_API_KEY"
+    if is_api_check:
+        if url != OPENAI_MODELS_URL or method != "GET":
+            return False, "Проверка API разрешает только GET /v1/models на api.openai.com"
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            return False, "Ключ OPENAI_API_KEY не указан"
+        headers["Authorization"] = f"Bearer {api_key}"
     started_at = time.monotonic()
     request_options = {"json": probe["json"]} if method == "POST" and "json" in probe else {}
-    is_json_request = bool(request_options)
+    is_json_response = bool(request_options) or is_api_check
     try:
         response = requests.request(
             method=method,
             url=url,
             timeout=max(0.2, float(timeout_seconds)),
-            allow_redirects=True,
+            allow_redirects=not is_api_check,
             headers=headers,
-            stream=is_json_request or bool(must_contain and method == "GET"),
+            stream=is_json_response or bool(must_contain and method == "GET"),
             **request_options,
         )
 
         with response:
             if time.monotonic() - started_at >= timeout_seconds:
                 return False, f"{method} {url} -> превышен лимит {timeout_seconds:g} с"
+            if is_api_check and response.status_code != 200:
+                return False, f"OpenAI API -> HTTP {response.status_code}"
             if response.status_code < 200 or response.status_code >= 400:
                 return False, f"{method} {url} -> HTTP {response.status_code}"
 
-            if is_json_request:
+            if is_json_response:
                 body = bytearray()
                 while time.monotonic() - started_at < timeout_seconds:
                     chunk = response.raw.read1(8192, decode_content=True)
@@ -1114,12 +1237,15 @@ def check_service_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]
                 else:
                     return False, f"{method} {url} -> превышен лимит {timeout_seconds:g} с"
                 try:
-                    if not isinstance(json.loads(body), dict):
+                    payload = json.loads(body)
+                    if not isinstance(payload, dict):
                         return False, f"{method} {url} -> некорректный JSON-ответ"
                 except (ValueError, UnicodeError):
                     return False, f"{method} {url} -> некорректный JSON-ответ"
                 if must_contain and must_contain.encode("utf-8") not in body:
                     return False, f"{method} {url} -> HTTP {response.status_code}, marker missing"
+                if is_api_check and (payload.get("object") != "list" or not isinstance(payload.get("data"), list)):
+                    return False, "OpenAI API -> ответ не содержит список моделей"
             elif must_contain:
                 if method == "HEAD":
                     return False, f"{method} {url} -> HTTP {response.status_code}, no body to verify"
@@ -1134,25 +1260,31 @@ def check_service_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]
         return False, f"{method} {url} -> {type(exc).__name__}"
 
 
-def check_connectivity(urls: list[str], timeout_seconds: float, attempts: int) -> bool:
-    urls = [url for url in urls if isinstance(url, str) and url.strip()]
+def check_connectivity(
+    urls: list[dict], timeout_seconds: float, attempts: int, logger: Optional[logging.Logger] = None,
+) -> bool:
     if not urls:
         return False
 
     for attempt_index in range(max(1, attempts)):
+        started_at = time.monotonic()
         executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=min(len(urls), 6),
             thread_name_prefix="connectivity-probe",
         )
-        futures = [executor.submit(http_probe, url, timeout_seconds, "TCP") for url in urls]
+        futures = [executor.submit(check_connectivity_probe, probe, timeout_seconds) for probe in urls]
         try:
-            for future in concurrent.futures.as_completed(futures, timeout=float(timeout_seconds) + 0.5):
-                ok, _detail = future.result()
+            remaining = max(0.0, timeout_seconds - (time.monotonic() - started_at))
+            for future in concurrent.futures.as_completed(futures, timeout=remaining):
+                ok, detail = future.result()
+                if logger:
+                    logger.info("Проверка интернета: %s", detail)
                 if ok:
                     executor.shutdown(wait=False, cancel_futures=True)
                     return True
         except concurrent.futures.TimeoutError:
-            pass
+            if logger:
+                logger.info("Проверка интернета: ожидаемый ответ не получен за %.1f с", timeout_seconds)
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
@@ -1358,14 +1490,32 @@ def offline_services(state: NetworkState) -> list[ServiceStatus]:
     return [service for service in state.service_statuses if service.online is False]
 
 
+def group_service_statuses(statuses: tuple[ServiceStatus, ...]) -> tuple[ServiceStatus, ...]:
+    by_id = {service.service_id: service for service in statuses}
+    site, initialization = by_id.get("chatgpt"), by_id.get("chatgpt-init")
+    if site is None or initialization is None:
+        return statuses
+    combined = False if False in (site.online, initialization.online) else (
+        True if site.online is True and initialization.online is True else None
+    )
+    grouped = ServiceStatus("chatgpt", "ChatGPT", combined,
+                            (("сайт", site.online), ("ab.chatgpt.com", initialization.online)),
+                            notify=site.notify or initialization.notify)
+    return tuple(grouped if service.service_id == "chatgpt" else service
+                 for service in statuses if service.service_id != "chatgpt-init")
+
+
+def service_status_text(service: ServiceStatus) -> str:
+    if service.detail:
+        return f"{service.name}: {service.detail}"
+    if service.components and not all(online is True for _name, online in service.components):
+        parts = ", ".join(f"{name} {format_service_status(online)}" for name, online in service.components)
+        return f"{service.name}: {parts}"
+    return f"{service.name}: {format_service_status(service.online)}"
+
+
 def service_summary(state: NetworkState) -> str:
-    unavailable = offline_services(state)
-    if unavailable:
-        names = ", ".join(service.name for service in unavailable)
-        return f"Unavailable: {names}"
-    if any(service.online is None for service in state.service_statuses):
-        return "Services: CHECKING"
-    return "Services: ONLINE"
+    return " | ".join(service_status_text(service) for service in group_service_statuses(state.service_statuses))
 
 
 def service_status_map(state: NetworkState) -> dict[str, ServiceStatus]:
@@ -1373,10 +1523,8 @@ def service_status_map(state: NetworkState) -> dict[str, ServiceStatus]:
 
 
 def snapshot_text(state: NetworkState) -> str:
-    country = state.country_name or state.country_code or "Unknown"
-    if not state.online:
-        return "Internet: OFFLINE"
-    return f"Internet: ONLINE | {country} | {service_summary(state)}"
+    connection = (state.country_name or state.country_code or "Страна неизвестна") if state.online else "Нет интернета"
+    return f"{connection} | {service_summary(state)}"
 
 
 def format_service_status(value: Optional[bool]) -> str:
@@ -1416,49 +1564,25 @@ def collect_events(
     russia_codes: set[str],
     russia_names: set[str],
 ) -> list[NotificationEvent]:
-    if prev is None:
-        if notify_on_start and not notify_only_russia_transitions:
-            status = "ONLINE" if current.online else "OFFLINE"
-            return [
-                NotificationEvent(
-                    event_type="startup",
-                    message=snapshot_text(current),
-                    fingerprint=f"startup:{status}:{current.country_code or 'none'}",
-                )
-            ]
-        return []
-
     events: list[NotificationEvent] = []
-
-    if prev.online != current.online:
-        if not notify_only_russia_transitions:
-            status = "ONLINE" if current.online else "OFFLINE"
-            events.append(
-                NotificationEvent(
-                    event_type="internet_status",
-                    message=f"Internet status changed: {status}\n{snapshot_text(current)}",
-                    fingerprint=f"internet_status:{status}",
-                )
-            )
-        if not current.online:
-            return events
-
-    if notify_on_service_status_change and current.online:
-        prev_services = service_status_map(prev)
-        for service in current.service_statuses:
-            previous_service = prev_services.get(service.service_id)
-            if service.online is False and (
-                previous_service is None
-                or previous_service.online is not False
-                or not prev.online
-            ):
+    if not current.online:
+        return [NotificationEvent("internet_status", "Нет интернета", "internet_status:offline")]
+    if notify_on_service_status_change:
+        for service in group_service_statuses(current.service_statuses):
+            if service.online is False and service.notify and service.service_id != "openai-api":
                 events.append(
                     NotificationEvent(
                         event_type="service_status",
-                        message=f"Service unavailable: {service.name}",
+                        message=service_status_text(service),
                         fingerprint=f"service_status:{service.service_id}:offline",
                     )
                 )
+
+    if prev is None:
+        if notify_on_start and not notify_only_russia_transitions:
+            events.append(NotificationEvent("startup", snapshot_text(current),
+                                            f"startup:{current.country_code or 'none'}"))
+        return events
 
     prev_country_key = prev.country_code or prev.country_name
     current_country_key = current.country_code or current.country_name
@@ -1774,31 +1898,12 @@ def tray_status_lines(snapshot: StatusSnapshot) -> list[str]:
         return ["Статус: проверяется..." if snapshot.checking else "Статус: нет данных"]
 
     state = snapshot.state
-    internet = "ONLINE" if state.online else "OFFLINE"
-    country = state.country_name or state.country_code or "Unknown"
     checked_at = state.checked_at.strftime("%H:%M:%S")
-    unavailable = offline_services(state)
-    if state.online and not unavailable and country != "Unknown":
-        lines = [
-            "ONLINE",
-            country,
-            "Сервисы: ONLINE",
-        ]
-    else:
-        lines = [
-            f"Интернет: {internet}",
-            country,
-        ]
-        if state.online and unavailable:
-            lines.append("Нет доступа: " + ", ".join(service.name for service in unavailable))
-        elif state.online:
-            lines.append("Сервисы: ONLINE")
+    lines = [(state.country_name or state.country_code or "Страна неизвестна") if state.online else "Нет интернета"]
+    lines.extend(service_status_text(service) for service in group_service_statuses(state.service_statuses))
     lines.append(f"Обновлено: {checked_at}")
     if snapshot.checking:
         lines.append("Проверка: выполняется")
-    for service in state.service_statuses:
-        if service.service_id == "chatgpt-init":
-            lines.append(f"{service.name}: {format_service_status(service.online)}")
     return lines
 
 
@@ -1806,15 +1911,8 @@ def tray_tooltip(base_title: str, snapshot: StatusSnapshot) -> str:
     if snapshot.state is None:
         return f"{base_title} - checking" if snapshot.checking else base_title
     state = snapshot.state
-    internet = "ONLINE" if state.online else "OFFLINE"
-    country = state.country_name or state.country_code or "Unknown"
-    unavailable = offline_services(state)
-    if state.online and unavailable:
-        names = ", ".join(service.name for service in unavailable)
-        return f"{base_title} - Internet {internet}, unavailable: {names}, {country}"
-    if state.online and country != "Unknown":
-        return f"{base_title} - ONLINE, {country}, services ONLINE"
-    return f"{base_title} - Internet {internet}, {country}"
+    tooltip = f"{base_title} - {snapshot_text(state)}"
+    return tooltip if len(tooltip) <= 127 else tooltip[:126] + "…"
 
 
 def tray_supported() -> bool:
@@ -1867,6 +1965,7 @@ def run_cycle_checks(
             urls=config["connectivity_urls"],
             timeout_seconds=timeout,
             attempts=int(config["connectivity_attempts"]),
+            logger=logger,
         ): ("online", "Connectivity check"),
         executor.submit(
             fetch_country,
@@ -1898,7 +1997,7 @@ def run_cycle_checks(
     raw_country_name, raw_country_code, country_source = results["country"]
     raw_connectivity_online = bool(results["online"])
     raw_service_statuses = dict(results["services"])
-    raw_online = raw_connectivity_online or any(raw_service_statuses.values()) or bool(raw_country_name or raw_country_code)
+    raw_online = raw_connectivity_online
 
     return raw_online, raw_country_name, raw_country_code, country_source, raw_service_statuses
 
@@ -1927,6 +2026,7 @@ def run_monitor_loop(
     notification_policy = NotificationPolicy(
         cooldowns=config["notification_cooldowns_seconds"],
         dedup_window_seconds=int(config["dedup_window_seconds"]),
+        outage_state_path=Path(config["notification_state_path"]) if "notification_state_path" in config else None,
     )
 
     previous_state: Optional[NetworkState] = None
@@ -1986,6 +2086,9 @@ def run_monitor_loop(
                     service_id=service["id"],
                     name=service["name"],
                     online=debouncer.stable_service_online(service["id"]),
+                    detail=("ключ не указан" if service["id"] == "openai-api"
+                            and not os.environ.get("OPENAI_API_KEY", "").strip() else ""),
+                    notify=bool(service.get("notify", True)) and service["id"] != "openai-api",
                 )
                 for service in config["service_checks"]
             )
@@ -1993,10 +2096,11 @@ def run_monitor_loop(
                 online=debouncer.stable_online,
                 country_name=debouncer.stable_country_name if debouncer.stable_online else None,
                 country_code=debouncer.stable_country_code if debouncer.stable_online else None,
-                service_statuses=service_statuses,
+                service_statuses=group_service_statuses(service_statuses),
                 checked_at=now,
             )
             status_store.set_state(current_state)
+            notification_policy.observe_state(current_state)
 
             candidate_events = collect_events(
                 prev=previous_state,
@@ -2156,6 +2260,7 @@ def main() -> None:
     try:
         save_example_config(data_dir / "config.example.json")
         config = finalize_runtime_paths(load_config(config_path), data_dir)
+        load_dotenv(data_dir / ".env", override=False, interpolate=False)
 
         logger = setup_logging(config)
         if config_path.exists():

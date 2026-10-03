@@ -26,6 +26,11 @@ pip-wheel-metadata/
 logs/
 *.log
 config.json
+notification-state.json
+notification-state.tmp
+.env
+.env.*
+!.env.example
 
 # IDE / editor
 .idea/

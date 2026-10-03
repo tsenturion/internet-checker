@@ -1,9 +1,11 @@
 import copy
 import json
 import logging
+import os
 import threading
 import time
 import unittest
+from unittest import mock
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -13,6 +15,29 @@ import main
 class ProbeHandler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        status = 200
+        body = b"Microsoft Connect Test"
+        if path == "/portal":
+            body = b"<html>Sign in to Wi-Fi</html>"
+        elif path == "/redirect":
+            status, body = 302, b""
+        elif path == "/blocked":
+            status, body = 403, b"Access denied"
+        elif path == "/no-content":
+            status, body = 204, b""
+        elif path == "/v1/models":
+            self.server.received_authorization = self.headers.get("Authorization")
+            status = getattr(self.server, "api_status", 200)
+            body = b'{"object": "list", "data": [{"id": "test-model"}]}'
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        if status == 302:
+            self.send_header("Location", "/ok")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -49,6 +74,8 @@ class ProbeHandler(BaseHTTPRequestHandler):
 class ServiceChecksTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.proxy_environment = mock.patch.dict(os.environ, {"NO_PROXY": "127.0.0.1,localhost"})
+        cls.proxy_environment.start()
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), ProbeHandler)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
@@ -61,6 +88,7 @@ class ServiceChecksTest(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
         cls.thread.join()
+        cls.proxy_environment.stop()
 
     def probe_for(self, path):
         probe = copy.deepcopy(self.probe)
@@ -96,12 +124,63 @@ class ServiceChecksTest(unittest.TestCase):
         self.assertFalse(debouncer.stable_service_online("chatgpt-init"))
         self.assertTrue(debouncer.stable_service_online("chatgpt"))
 
-    def test_tray_shows_initialization_status(self):
+    def test_tray_groups_partial_chatgpt_access(self):
         state = main.NetworkState(True, "Italy", "IT", (
+            main.ServiceStatus("chatgpt", "ChatGPT", True),
             main.ServiceStatus("chatgpt-init", "ab.chatgpt.com", False),
         ), datetime.now())
         lines = main.tray_status_lines(main.StatusSnapshot(state, False, state.checked_at, None))
-        self.assertIn("ab.chatgpt.com: OFFLINE", lines)
+        self.assertIn("ChatGPT: сайт ONLINE, ab.chatgpt.com OFFLINE", lines)
+        self.assertFalse(any(line.startswith("ab.chatgpt.com:") for line in lines))
+        self.assertEqual(lines[0], "Italy")
+        self.assertNotIn("ONLINE", lines)
+
+    def test_connectivity_rejects_portal_redirect_and_block(self):
+        for path in ("/portal", "/redirect", "/blocked"):
+            with self.subTest(path=path):
+                probe = {"url": self.probe_for(path)["url"], "expected_status": 200,
+                         "expected_body": "Microsoft Connect Test"}
+                self.assertFalse(main.check_connectivity([probe], 1.0, 1))
+        self.assertTrue(main.check_connectivity([
+            {"url": self.probe_for("/ok")["url"], "expected_status": 200,
+             "expected_body": "Microsoft Connect Test"},
+        ], 1.0, 1))
+        self.assertFalse(main.check_connectivity([
+            {"url": self.probe_for("/ok")["url"], "expected_status": 200},
+        ], 1.0, 1))
+        self.assertTrue(main.check_connectivity([
+            {"url": self.probe_for("/no-content")["url"], "expected_status": 204},
+        ], 1.0, 1))
+
+    def test_missing_network_does_not_fall_back_to_tcp(self):
+        with mock.patch("main.requests.get", side_effect=main.requests.ConnectionError):
+            self.assertFalse(main.check_connectivity(main.DEFAULT_CONFIG["connectivity_urls"], 0.2, 1))
+
+    def test_api_checks_only_model_catalog_and_rejects_unauthorized(self):
+        url = self.probe_for("/v1/models")["url"]
+        probe = {"url": url, "method": "GET", "api_key_env": "OPENAI_API_KEY"}
+        with mock.patch.object(main, "OPENAI_MODELS_URL", url), mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-only"}):
+            self.server.api_status = 200
+            self.assertTrue(main.check_service_probe(probe, 1.0)[0])
+            self.assertEqual(self.server.received_authorization, "Bearer test-only")
+            self.server.api_status = 401
+            self.assertFalse(main.check_service_probe(probe, 1.0)[0])
+        self.server.api_status = 200
+
+    def test_api_never_sends_credentials_to_other_urls_or_generation(self):
+        probe = {"url": main.OPENAI_MODELS_URL, "method": "POST", "api_key_env": "OPENAI_API_KEY"}
+        with mock.patch("main.requests.request") as request:
+            self.assertFalse(main.check_service_probe(probe, 1.0)[0])
+            probe.update(url="https://example.invalid/v1/models", method="GET")
+            self.assertFalse(main.check_service_probe(probe, 1.0)[0])
+            request.assert_not_called()
+
+    def test_api_redirect_is_not_followed(self):
+        url = self.probe_for("/redirect")["url"]
+        with mock.patch.object(main, "OPENAI_MODELS_URL", url), mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-only"}):
+            self.assertFalse(main.check_service_probe({
+                "url": url, "method": "GET", "api_key_env": "OPENAI_API_KEY",
+            }, 1.0)[0])
 
 
 if __name__ == "__main__":

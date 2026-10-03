@@ -1,6 +1,6 @@
 {
   "check_interval_seconds": 5,
-  "request_timeout_seconds": 1.5,
+  "request_timeout_seconds": 3.0,
   "service_request_timeout_seconds": 8.0,
   "connectivity_success_confirmations": 1,
   "connectivity_fail_confirmations": 1,
@@ -39,13 +39,20 @@
   "log_to_console": true,
   "connectivity_attempts": 1,
   "connectivity_urls": [
-    "http://www.msftconnecttest.com/connecttest.txt",
-    "https://cloudflare.com/cdn-cgi/trace",
-    "https://clients3.google.com/generate_204",
-    "tcp://8.8.8.8:53",
-    "tcp://8.8.4.4:53",
-    "tcp://9.9.9.9:53",
-    "tcp://208.67.222.222:53"
+    {
+      "url": "https://www.msftconnecttest.com/connecttest.txt",
+      "expected_status": 200,
+      "expected_body": "Microsoft Connect Test"
+    },
+    {
+      "url": "https://www.cloudflare.com/cdn-cgi/trace",
+      "expected_status": 200,
+      "must_contain": "h=www.cloudflare.com\n"
+    },
+    {
+      "url": "https://clients3.google.com/generate_204",
+      "expected_status": 204
+    }
   ],
   "country_lookup_urls": [
     "https://ipwho.is/",
@@ -56,6 +63,7 @@
     {
       "id": "chatgpt",
       "name": "ChatGPT",
+      "fail_confirmations": 1,
       "probe_urls": [
         {
           "url": "https://chatgpt.com/",
@@ -85,6 +93,36 @@
             }
           },
           "must_contain": "\"feature_gates\""
+        }
+      ]
+    },
+    {
+      "id": "openai-api",
+      "name": "OpenAI API",
+      "notify": false,
+      "timeout_seconds": 10.0,
+      "fail_confirmations": 1,
+      "probe_urls": [
+        {
+          "url": "https://api.openai.com/v1/models",
+          "method": "GET",
+          "api_key_env": "OPENAI_API_KEY"
+        }
+      ]
+    },
+    {
+      "id": "telegram",
+      "name": "Telegram Desktop",
+      "timeout_seconds": 10.0,
+      "fail_confirmations": 1,
+      "probe_urls": [
+        {
+          "url": "mtproto://149.154.167.51:443",
+          "method": "MTPROTO"
+        },
+        {
+          "url": "mtproto://149.154.167.91:443",
+          "method": "MTPROTO"
         }
       ]
     },

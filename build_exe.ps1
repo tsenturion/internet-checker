@@ -11,12 +11,12 @@ Write-Host "Installing build dependencies..."
 Write-Host "Building InternetChecker (onefile)..."
 & $Python -m PyInstaller `
     --noconfirm `
-    --clean `
     --onefile `
     --windowed `
     --name InternetChecker `
     --collect-all windows_toasts `
     --hidden-import pystray._win32 `
+    --exclude-module IPython `
     main.py
 
 Write-Host "Done. EXE: dist\\InternetChecker.exe"
