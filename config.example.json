@@ -65,6 +65,30 @@
       ]
     },
     {
+      "id": "chatgpt-init",
+      "name": "ab.chatgpt.com",
+      "timeout_seconds": 10.0,
+      "fail_confirmations": 1,
+      "probe_urls": [
+        {
+          "url": "https://ab.chatgpt.com/v1/initialize?k=client-sYWqzCYMRkUg4DqqiZcR5DGTNl2iD7zNJY0HoeDLzxR&st=javascript-client&sv=3.34.0",
+          "method": "POST",
+          "json": {
+            "user": {
+              "userID": "internet-checker-anonymous"
+            },
+            "hash": "djb2",
+            "deltasResponseRequested": false,
+            "statsigMetadata": {
+              "sdkType": "javascript-client",
+              "sdkVersion": "3.34.0"
+            }
+          },
+          "must_contain": "\"feature_gates\""
+        }
+      ]
+    },
+    {
       "id": "netology",
       "name": "Netology",
       "probe_urls": [

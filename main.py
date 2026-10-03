@@ -22,6 +22,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
+from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
 try:
     import tkinter as tk
@@ -108,6 +109,29 @@ DEFAULT_CONFIG = {
             "name": "ChatGPT",
             "probe_urls": [
                 {"url": "https://chatgpt.com/", "method": "GET", "must_contain": "ChatGPT"},
+            ],
+        },
+        {
+            "id": "chatgpt-init",
+            "name": "ab.chatgpt.com",
+            "timeout_seconds": 10.0,
+            "fail_confirmations": 1,
+            "probe_urls": [
+                {
+                    "url": (
+                        "https://ab.chatgpt.com/v1/initialize"
+                        "?k=client-sYWqzCYMRkUg4DqqiZcR5DGTNl2iD7zNJY0HoeDLzxR"
+                        "&st=javascript-client&sv=3.34.0"
+                    ),
+                    "method": "POST",
+                    "json": {
+                        "user": {"userID": "internet-checker-anonymous"},
+                        "hash": "djb2",
+                        "deltasResponseRequested": False,
+                        "statsigMetadata": {"sdkType": "javascript-client", "sdkVersion": "3.34.0"},
+                    },
+                    "must_contain": '"feature_gates"',
+                },
             ],
         },
         {
@@ -285,12 +309,14 @@ class StateDebouncer:
         country_confirmations: int,
         service_success: int,
         service_fail: int,
+        service_fail_overrides: Optional[dict[str, int]] = None,
     ):
         self._online_success_required = max(1, int(online_success))
         self._online_fail_required = max(1, int(online_fail))
         self._country_required = max(1, int(country_confirmations))
         self._service_success_required = max(1, int(service_success))
         self._service_fail_required = max(1, int(service_fail))
+        self._service_fail_overrides = service_fail_overrides or {}
 
         self._stable_online: Optional[bool] = None
         self._stable_country_name: Optional[str] = None
@@ -367,7 +393,7 @@ class StateDebouncer:
             if service_state.update(
                 raw_online,
                 self._service_success_required,
-                self._service_fail_required,
+                self._service_fail_overrides.get(service_id, self._service_fail_required),
             ):
                 changed = True
         return changed
@@ -546,13 +572,13 @@ class StatusStore:
             )
 
 
-def normalize_probe_urls(value: object, default: list[dict[str, str]], default_method: str) -> list[dict[str, str]]:
+def normalize_probe_urls(value: object, default: list[dict], default_method: str) -> list[dict]:
     if isinstance(value, str):
         value = [value]
     if not isinstance(value, list):
         value = []
 
-    probes: list[dict[str, str]] = []
+    probes: list[dict] = []
     for item in value:
         if isinstance(item, str):
             url = item.strip()
@@ -570,12 +596,14 @@ def normalize_probe_urls(value: object, default: list[dict[str, str]], default_m
 
         if not url:
             continue
-        if method not in {"GET", "HEAD", "TCP"}:
+        if method not in {"GET", "HEAD", "POST", "TCP"}:
             method = default_method
 
         probe = {"url": url, "method": method}
         if must_contain:
             probe["must_contain"] = must_contain
+        if method == "POST" and isinstance(item, dict) and isinstance(item.get("json"), dict):
+            probe["json"] = copy.deepcopy(item["json"])
         probes.append(probe)
 
     return probes or copy.deepcopy(default)
@@ -640,9 +668,9 @@ def normalize_service_checks(value: object, default: list[dict]) -> list[dict]:
                 probe_value = item.get("urls")
             elif isinstance(item.get("url"), str):
                 probe = {"url": item["url"]}
-                for key in ("method", "must_contain"):
-                    if isinstance(item.get(key), str):
-                        probe[key] = item[key]
+                for key in ("method", "must_contain", "json"):
+                    if key in item:
+                        probe[key] = copy.deepcopy(item[key])
                 probe_value = [probe]
             else:
                 probe_value = []
@@ -664,13 +692,13 @@ def normalize_service_checks(value: object, default: list[dict]) -> list[dict]:
             suffix += 1
         used_ids.add(unique_id)
 
-        services.append(
-            {
-                "id": unique_id,
-                "name": service_name,
-                "probe_urls": probes,
-            }
-        )
+        service = {"id": unique_id, "name": service_name, "probe_urls": probes}
+        if isinstance(item, dict):
+            if "timeout_seconds" in item:
+                service["timeout_seconds"] = max(0.2, float(item["timeout_seconds"]))
+            if "fail_confirmations" in item:
+                service["fail_confirmations"] = max(1, int(item["fail_confirmations"]))
+        services.append(service)
 
     return services or copy.deepcopy(default)
 
@@ -923,6 +951,14 @@ def setup_logging(config: dict) -> logging.Logger:
 
     log_path = Path(config["log_file_path"])
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    retention_cutoff = time.time() - 30 * 24 * 60 * 60
+    log_files = [log_path] + [
+        log_path.with_name(f"{log_path.name}.{index}")
+        for index in range(1, int(config["log_backup_count"]) + 1)
+    ]
+    for old_log in log_files:
+        if old_log.is_file() and old_log.stat().st_mtime < retention_cutoff:
+            old_log.unlink()
 
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
@@ -1023,7 +1059,7 @@ def response_contains_marker(response: requests.Response, marker: str, max_bytes
     return False
 
 
-def check_service_probe(probe: dict[str, str], timeout_seconds: float) -> tuple[bool, str]:
+def check_service_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]:
     url = probe.get("url", "").strip()
     if not url:
         return False, "empty service probe URL"
@@ -1031,12 +1067,12 @@ def check_service_probe(probe: dict[str, str], timeout_seconds: float) -> tuple[
     method = probe.get("method", "GET").strip().upper()
     if method == "TCP":
         method = "GET"
-    if method not in {"GET", "HEAD"}:
+    if method not in {"GET", "HEAD", "POST"}:
         method = "GET"
 
     must_contain = probe.get("must_contain")
     parsed_host = urlparse(url).hostname or ""
-    if not must_contain and method == "GET" and parsed_host.endswith("chatgpt.com"):
+    if not must_contain and method == "GET" and parsed_host in {"chatgpt.com", "www.chatgpt.com"}:
         must_contain = "ChatGPT"
 
     headers = {
@@ -1048,28 +1084,53 @@ def check_service_probe(probe: dict[str, str], timeout_seconds: float) -> tuple[
             "Chrome/126.0 Safari/537.36"
         ),
     }
+    started_at = time.monotonic()
+    request_options = {"json": probe["json"]} if method == "POST" and "json" in probe else {}
+    is_json_request = bool(request_options)
     try:
         response = requests.request(
             method=method,
             url=url,
-            timeout=max(1.0, float(timeout_seconds)),
+            timeout=max(0.2, float(timeout_seconds)),
             allow_redirects=True,
             headers=headers,
-            stream=bool(must_contain and method == "GET"),
+            stream=is_json_request or bool(must_contain and method == "GET"),
+            **request_options,
         )
 
         with response:
+            if time.monotonic() - started_at >= timeout_seconds:
+                return False, f"{method} {url} -> превышен лимит {timeout_seconds:g} с"
             if response.status_code < 200 or response.status_code >= 400:
                 return False, f"{method} {url} -> HTTP {response.status_code}"
 
-            if must_contain:
+            if is_json_request:
+                body = bytearray()
+                while time.monotonic() - started_at < timeout_seconds:
+                    chunk = response.raw.read1(8192, decode_content=True)
+                    if not chunk:
+                        break
+                    body.extend(chunk)
+                else:
+                    return False, f"{method} {url} -> превышен лимит {timeout_seconds:g} с"
+                try:
+                    if not isinstance(json.loads(body), dict):
+                        return False, f"{method} {url} -> некорректный JSON-ответ"
+                except (ValueError, UnicodeError):
+                    return False, f"{method} {url} -> некорректный JSON-ответ"
+                if must_contain and must_contain.encode("utf-8") not in body:
+                    return False, f"{method} {url} -> HTTP {response.status_code}, marker missing"
+            elif must_contain:
                 if method == "HEAD":
                     return False, f"{method} {url} -> HTTP {response.status_code}, no body to verify"
                 if not response_contains_marker(response, must_contain):
                     return False, f"{method} {url} -> HTTP {response.status_code}, marker missing"
 
+            if time.monotonic() - started_at >= timeout_seconds:
+                return False, f"{method} {url} -> превышен лимит {timeout_seconds:g} с"
+
             return True, f"{method} {url} -> HTTP {response.status_code}"
-    except requests.RequestException as exc:
+    except (requests.RequestException, Urllib3HTTPError, OSError) as exc:
         return False, f"{method} {url} -> {type(exc).__name__}"
 
 
@@ -1211,10 +1272,16 @@ def fetch_country(
     return None, None, None
 
 
-def check_service(probes: list[dict[str, str]], timeout_seconds: float) -> bool:
+def check_service(
+    probes: list[dict],
+    timeout_seconds: float,
+    logger: Optional[logging.Logger] = None,
+    service_name: str = "",
+) -> bool:
     if not probes:
         return False
 
+    started_at = time.monotonic()
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=min(len(probes), 4),
         thread_name_prefix="service-probe",
@@ -1226,17 +1293,26 @@ def check_service(probes: list[dict[str, str]], timeout_seconds: float) -> bool:
     ]
 
     try:
-        for future in concurrent.futures.as_completed(futures, timeout=float(timeout_seconds) + 0.5):
-            ok, _detail = future.result()
-            if ok:
+        remaining = max(0.0, timeout_seconds - (time.monotonic() - started_at))
+        for future in concurrent.futures.as_completed(futures, timeout=remaining):
+            ok, detail = future.result()
+            elapsed = time.monotonic() - started_at
+            if logger:
+                logger.info("%s: %s (%.2f с / %.1f с)", service_name, detail, elapsed, timeout_seconds)
+            if ok and elapsed < timeout_seconds:
                 executor.shutdown(wait=False, cancel_futures=True)
                 return True
     except concurrent.futures.TimeoutError:
-        pass
+        if logger:
+            logger.info("%s: ответ не получен за %.1f с", service_name, timeout_seconds)
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 
     return False
+
+
+def max_service_timeout(service_checks: list[dict], default_timeout: float) -> float:
+    return max([default_timeout] + [float(service.get("timeout_seconds", default_timeout)) for service in service_checks])
 
 
 def check_services(service_checks: list[dict], timeout_seconds: float, logger: logging.Logger) -> dict[str, bool]:
@@ -1249,19 +1325,27 @@ def check_services(service_checks: list[dict], timeout_seconds: float, logger: l
         thread_name_prefix="service-check",
     )
     future_map = {
-        executor.submit(check_service, service["probe_urls"], timeout_seconds): service
+        executor.submit(
+            check_service,
+            service["probe_urls"],
+            float(service.get("timeout_seconds", timeout_seconds)),
+            logger,
+            service["name"],
+        ): service
         for service in service_checks
     }
 
     try:
-        for future in concurrent.futures.as_completed(future_map, timeout=float(timeout_seconds) + 0.75):
+        for future in concurrent.futures.as_completed(
+            future_map, timeout=max_service_timeout(service_checks, timeout_seconds) + 0.5
+        ):
             service = future_map[future]
             try:
                 results[service["id"]] = bool(future.result())
             except Exception as exc:
                 logger.info("%s service check failed: %s", service["name"], exc)
     except concurrent.futures.TimeoutError:
-        logger.info("Service checks timed out after %.1fs", float(timeout_seconds) + 0.75)
+        logger.info("Service checks timed out after %.1fs", max_service_timeout(service_checks, timeout_seconds) + 0.5)
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 
@@ -1712,6 +1796,9 @@ def tray_status_lines(snapshot: StatusSnapshot) -> list[str]:
     lines.append(f"Обновлено: {checked_at}")
     if snapshot.checking:
         lines.append("Проверка: выполняется")
+    for service in state.service_statuses:
+        if service.service_id == "chatgpt-init":
+            lines.append(f"{service.name}: {format_service_status(service.online)}")
     return lines
 
 
@@ -1766,7 +1853,7 @@ def run_cycle_checks(
 ) -> tuple[bool, Optional[str], Optional[str], Optional[str], dict[str, bool]]:
     timeout = float(config["request_timeout_seconds"])
     service_timeout = float(config["service_request_timeout_seconds"])
-    overall_timeout = max(1.0, timeout + 1.0, service_timeout + 0.75)
+    overall_timeout = max(1.0, timeout + 1.0, max_service_timeout(config["service_checks"], service_timeout) + 0.75)
     defaults = {
         "online": False,
         "country": (None, None, None),
@@ -1831,6 +1918,11 @@ def run_monitor_loop(
         country_confirmations=int(config["country_confirmations"]),
         service_success=int(config["service_success_confirmations"]),
         service_fail=int(config["service_fail_confirmations"]),
+        service_fail_overrides={
+            service["id"]: service["fail_confirmations"]
+            for service in config["service_checks"]
+            if "fail_confirmations" in service
+        },
     )
     notification_policy = NotificationPolicy(
         cooldowns=config["notification_cooldowns_seconds"],

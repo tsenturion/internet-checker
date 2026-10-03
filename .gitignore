@@ -37,5 +37,4 @@ config.json
 Thumbs.db
 Desktop.ini
 
-# Инструкции для нейросетевых агентов
 AGENTS.md

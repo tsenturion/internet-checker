@@ -15,11 +15,12 @@ if (-not (Test-Path $sourcePath)) {
     throw "Source executable not found: $SourceExe"
 }
 
-Write-Host "Stopping running InternetChecker processes..."
+Write-Host "Остановка установленного приложения из Startup..."
 for ($i = 0; $i -lt 12; $i++) {
-    $procs = Get-Process | Where-Object { $_.ProcessName -eq "InternetChecker" }
+    $procs = Get-CimInstance Win32_Process -Filter "Name = 'InternetChecker.exe'" |
+        Where-Object { $_.ExecutablePath -eq $targetExe }
     if (-not $procs) { break }
-    $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+    $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 250
 }
 
@@ -27,11 +28,11 @@ New-Item -Path $startupDir -ItemType Directory -Force | Out-Null
 
 if (Test-Path $legacyShortcut) {
     Write-Host "Removing legacy startup shortcut: $legacyShortcut"
-    Remove-Item -Path $legacyShortcut -Force
+    Remove-Item -LiteralPath $legacyShortcut -Force
 }
 
 Write-Host "Installing startup EXE: $targetExe"
-Copy-Item -Path $sourcePath -Destination $targetExe -Force
+Copy-Item -LiteralPath $sourcePath -Destination $targetExe -Force
 
 if (-not (Test-Path $targetExe)) {
     throw "Installed executable not found: $targetExe"
