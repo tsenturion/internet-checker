@@ -1669,12 +1669,26 @@ def open_path(path: Path) -> None:
     raise RuntimeError("No supported file opener found.")
 
 
-def create_tray_image() -> Image.Image:
-    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+def tray_all_online(snapshot: StatusSnapshot) -> bool:
+    state = snapshot.state
+    return bool(state is not None and not snapshot.last_error and state.online
+                and all(service.online is True for service in state.service_statuses))
+
+
+def create_tray_image(online: bool) -> Image.Image:
+    image = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    draw.ellipse((6, 6, 58, 58), fill=(32, 109, 221, 255), outline=(255, 255, 255, 255), width=2)
-    draw.ellipse((20, 20, 44, 44), fill=(255, 255, 255, 255))
-    return image
+    if online:
+        draw.rounded_rectangle((16, 16, 240, 240), radius=40, fill=(34, 197, 94, 255))
+        draw.polygon(((56, 128), (80, 104), (112, 137), (181, 65), (206, 89), (111, 186)),
+                     fill=(255, 255, 255, 255))
+    else:
+        color = (239, 68, 68, 255)
+        draw.line((60, 60, 196, 196), fill=color, width=42)
+        draw.line((60, 196, 196, 60), fill=color, width=42)
+        for x, y in ((60, 60), (60, 196), (196, 60), (196, 196)):
+            draw.ellipse((x - 21, y - 21, x + 21, y + 21), fill=color)
+    return image.resize((64, 64), Image.Resampling.LANCZOS)
 
 
 class TrayPopupController:
@@ -2170,10 +2184,13 @@ def run_with_tray(
         check_now_event=check_now_event,
         stop_event=stop_event,
     )
+    initial_snapshot = status_store.snapshot()
+    initial_online = tray_all_online(initial_snapshot)
+    tray_images = {online: create_tray_image(online) for online in (False, True)}
     tray_icon = ClickMenuIcon(
         name="internet-checker",
-        icon=create_tray_image(),
-        title=tray_tooltip(str(config["tray_icon_tooltip"]), status_store.snapshot()),
+        icon=tray_images[initial_online],
+        title=tray_tooltip(str(config["tray_icon_tooltip"]), initial_snapshot),
         menu=None,
         popup_controller=popup_controller,
     )
@@ -2186,17 +2203,24 @@ def run_with_tray(
             except Exception:
                 pass
 
-    def refresh_tooltip() -> None:
+    def refresh_tray_status() -> None:
+        previous_online = initial_online
         while not stop_event.is_set():
             try:
-                tray_icon.title = tray_tooltip(str(config["tray_icon_tooltip"]), status_store.snapshot())
+                snapshot = status_store.snapshot()
+                online = tray_all_online(snapshot)
+                tray_icon.title = tray_tooltip(str(config["tray_icon_tooltip"]), snapshot)
+                if online != previous_online:
+                    tray_icon.icon = tray_images[online]
+                    previous_online = online
+                    logger.info("Иконка трея: %s", "зелёная галочка" if online else "красный крестик")
             except Exception:
                 pass
-            time.sleep(1)
+            stop_event.wait(1)
 
     watcher = threading.Thread(target=watch_monitor, name="tray-monitor-watcher", daemon=True)
     watcher.start()
-    refresher = threading.Thread(target=refresh_tooltip, name="tray-tooltip-refresher", daemon=True)
+    refresher = threading.Thread(target=refresh_tray_status, name="tray-status-refresher", daemon=True)
     refresher.start()
 
     tray_icon.run()
