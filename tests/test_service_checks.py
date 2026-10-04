@@ -156,7 +156,7 @@ class ServiceChecksTest(unittest.TestCase):
         ], 1.0, 1))
 
     def test_missing_network_does_not_fall_back_to_tcp(self):
-        with mock.patch("main.requests.get", side_effect=main.requests.ConnectionError):
+        with mock.patch("main.requests.request", side_effect=main.requests.ConnectionError):
             self.assertFalse(main.check_connectivity(main.DEFAULT_CONFIG["connectivity_urls"], 0.2, 1))
 
     def test_api_checks_only_model_catalog_and_rejects_unauthorized(self):

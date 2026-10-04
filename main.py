@@ -33,6 +33,8 @@ import requests
 import socks
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw
+from network_metrics import (TrafficCollector, configure_metrics, record_protocol_bytes,
+                             summary_lines, tracked_probe, tracked_request)
 try:
     from pystray import Icon
 except Exception:
@@ -1037,6 +1039,7 @@ def setup_logging(config: dict) -> logging.Logger:
     return logger
 
 
+@tracked_probe("Интернет")
 def check_connectivity_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]:
     url = probe.get("url", "")
     if urlparse(url).scheme not in {"http", "https"}:
@@ -1045,7 +1048,7 @@ def check_connectivity_probe(probe: dict, timeout_seconds: float) -> tuple[bool,
         return False, "Не задано ожидаемое содержимое ответа проверки интернета"
     started_at = time.monotonic()
     try:
-        with requests.get(
+        with tracked_request("GET",
             build_country_request_url(url, no_cache=True),
             timeout=max(0.2, timeout_seconds),
             allow_redirects=False,
@@ -1104,6 +1107,7 @@ def receive_mtproto_bytes(connection: socket.socket, size: int, deadline: float)
         chunk = connection.recv(size - len(data))
         if not chunk:
             raise ConnectionError("Сервер MTProto закрыл соединение")
+        record_protocol_bytes(rx=len(chunk))
         data.extend(chunk)
     return bytes(data)
 
@@ -1143,6 +1147,7 @@ def check_mtproto_probe(url: str, timeout_seconds: float) -> tuple[bool, str]:
                 raise TimeoutError("Превышен лимит MTProto")
             connection.settimeout(remaining)
             connection.sendall(b"\xef" + bytes([len(payload) // 4]) + payload)
+            record_protocol_bytes(tx=len(payload) + 2)
             header = receive_mtproto_bytes(connection, 1, deadline)[0]
             if header == 0x7F:
                 size = int.from_bytes(receive_mtproto_bytes(connection, 3, deadline), "little") * 4
@@ -1172,6 +1177,7 @@ def check_mtproto_probe(url: str, timeout_seconds: float) -> tuple[bool, str]:
         return False, f"{url} -> {type(exc).__name__}"
 
 
+@tracked_probe("Сервис")
 def check_service_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]:
     url = probe.get("url", "").strip()
     if not url:
@@ -1209,7 +1215,7 @@ def check_service_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]
     request_options = {"json": probe["json"]} if method == "POST" and "json" in probe else {}
     is_json_response = bool(request_options) or is_api_check
     try:
-        response = requests.request(
+        with tracked_request(
             method=method,
             url=url,
             timeout=max(0.2, float(timeout_seconds)),
@@ -1217,9 +1223,7 @@ def check_service_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]
             headers=headers,
             stream=is_json_response or bool(must_contain and method == "GET"),
             **request_options,
-        )
-
-        with response:
+        ) as response:
             if time.monotonic() - started_at >= timeout_seconds:
                 return False, f"{method} {url} -> превышен лимит {timeout_seconds:g} с"
             if is_api_check and response.status_code != 200:
@@ -1342,6 +1346,7 @@ def build_country_request_url(url: str, no_cache: bool) -> str:
     return f"{url}{separator}_ts={int(time.time() * 1000)}"
 
 
+@tracked_probe("Страна")
 def fetch_country_from_url(
     url: str,
     timeout_seconds: float,
@@ -1352,16 +1357,16 @@ def fetch_country_from_url(
         headers.update({"Cache-Control": "no-cache", "Pragma": "no-cache"})
     request_url = build_country_request_url(url, no_cache=no_cache)
     try:
-        response = requests.get(
+        with tracked_request("GET",
             request_url,
             timeout=max(0.2, float(timeout_seconds)),
             headers=headers,
-        )
-        response.raise_for_status()
-        country_name, country_code = parse_country_payload(response.json())
-        if country_name or country_code:
-            return country_name, country_code, url, None
-        return None, None, url, "empty response"
+        ) as response:
+            response.raise_for_status()
+            country_name, country_code = parse_country_payload(response.json())
+            if country_name or country_code:
+                return country_name, country_code, url, None
+            return None, None, url, "empty response"
     except (requests.RequestException, ValueError) as exc:
         return None, None, url, type(exc).__name__
 
@@ -1679,7 +1684,7 @@ def create_tray_image(online: bool) -> Image.Image:
     image = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
     if online:
-        draw.rounded_rectangle((16, 16, 240, 240), radius=40, fill=(34, 197, 94, 255))
+        draw.ellipse((12, 12, 244, 244), fill=(0, 100, 45, 255))
         draw.polygon(((56, 128), (80, 104), (112, 137), (181, 65), (206, 89), (111, 186)),
                      fill=(255, 255, 255, 255))
     else:
@@ -1699,12 +1704,15 @@ class TrayPopupController:
         status_store: StatusStore,
         check_now_event: threading.Event,
         stop_event: threading.Event,
+        traffic_collector: TrafficCollector,
     ) -> None:
         self._config = config
         self._logger = logger
         self._status_store = status_store
         self._check_now_event = check_now_event
         self._stop_event = stop_event
+        self._traffic_collector = traffic_collector
+        self._metrics_window = None
         self._commands: queue.Queue[str] = queue.Queue()
         self._ready = threading.Event()
         self._root: Optional[tk.Tk] = None
@@ -1770,6 +1778,7 @@ class TrayPopupController:
         self._separator(body)
         self._menu_button(body, str(self._config["tray_show_status_label"]), self._show_status_notification)
         self._menu_button(body, str(self._config["tray_check_now_label"]), self._check_now)
+        self._menu_button(body, "Использование сети…", self._show_network_metrics)
         self._menu_button(body, str(self._config["tray_open_log_label"]), self._open_log)
         self._separator(body)
         self._menu_button(body, str(self._config["tray_exit_label"]), self._exit_app)
@@ -1841,7 +1850,8 @@ class TrayPopupController:
             return
         for child in self._status_frame.winfo_children():
             child.destroy()
-        for line in tray_status_lines(self._status_store.snapshot()):
+        for line in (tray_status_lines(self._status_store.snapshot())
+                     + summary_lines(self._traffic_collector.snapshot())):
             tk.Label(
                 self._status_frame,
                 text=line,
@@ -1884,6 +1894,18 @@ class TrayPopupController:
             open_path(log_path)
         except Exception as exc:
             self._logger.info("Opening log file failed: %s", exc)
+
+    def _show_network_metrics(self) -> None:
+        self._hide_popup()
+        if self._root is None:
+            return
+        try:
+            if self._metrics_window is None or not self._metrics_window.window.winfo_exists():
+                from network_metrics_ui import MetricsWindow
+                self._metrics_window = MetricsWindow(self._root, self._traffic_collector, self._logger)
+            self._metrics_window.show()
+        except Exception:
+            self._logger.exception("Не удалось открыть окно использования сети")
 
     def _exit_app(self) -> None:
         self._logger.info("Tray exit requested.")
@@ -2176,6 +2198,7 @@ def run_with_tray(
     monitor_thread: threading.Thread,
     status_store: StatusStore,
     check_now_event: threading.Event,
+    traffic_collector: TrafficCollector,
 ) -> None:
     popup_controller = TrayPopupController(
         config=config,
@@ -2183,6 +2206,7 @@ def run_with_tray(
         status_store=status_store,
         check_now_event=check_now_event,
         stop_event=stop_event,
+        traffic_collector=traffic_collector,
     )
     initial_snapshot = status_store.snapshot()
     initial_online = tray_all_online(initial_snapshot)
@@ -2283,6 +2307,8 @@ def main() -> None:
     check_now_event = threading.Event()
     status_store = StatusStore()
     logger: Optional[logging.Logger] = None
+    traffic_collector = None
+    traffic_thread = None
 
     try:
         save_example_config(data_dir / "config.example.json")
@@ -2290,6 +2316,13 @@ def main() -> None:
         load_dotenv(data_dir / ".env", override=False, interpolate=False)
 
         logger = setup_logging(config)
+        labels = {urlparse(probe["url"]).hostname: service["name"]
+                  for service in config["service_checks"] for probe in service["probe_urls"]}
+        traffic_collector = TrafficCollector(data_dir / "network-metrics.json", labels, logger)
+        configure_metrics(traffic_collector)
+        traffic_thread = threading.Thread(target=traffic_collector.run, args=(stop_event,),
+                                          name="traffic-history-saver", daemon=True)
+        traffic_thread.start()
         if config_path.exists():
             logger.info("Config loaded from: %s", config_path.resolve())
         else:
@@ -2336,12 +2369,19 @@ def main() -> None:
                 monitor_thread=monitor_thread,
                 status_store=status_store,
                 check_now_event=check_now_event,
+                traffic_collector=traffic_collector,
             )
     except KeyboardInterrupt:
         if logger:
             logger.info("Stopping on keyboard interrupt.")
         stop_event.set()
     finally:
+        stop_event.set()
+        if traffic_thread is not None:
+            traffic_thread.join(timeout=2)
+        if traffic_collector is not None:
+            traffic_collector.save()
+        configure_metrics(None)
         single_instance.release()
 
 

@@ -28,6 +28,8 @@ logs/
 config.json
 notification-state.json
 notification-state.tmp
+network-metrics.json
+network-metrics.tmp
 .env
 .env.*
 !.env.example
