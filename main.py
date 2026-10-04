@@ -59,9 +59,10 @@ OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
 DEFAULT_CONFIG = {
     "check_interval_seconds": 5,
     "request_timeout_seconds": 3.0,
+    "connectivity_timeout_seconds": 10.0,
     "service_request_timeout_seconds": 8.0,
     "connectivity_success_confirmations": 1,
-    "connectivity_fail_confirmations": 1,
+    "connectivity_fail_confirmations": 2,
     "country_confirmations": 1,
     "service_success_confirmations": 1,
     "service_fail_confirmations": 3,
@@ -365,6 +366,10 @@ class StateDebouncer:
     @property
     def has_stable_online(self) -> bool:
         return self._stable_online is not None
+
+    @property
+    def connectivity_failure_progress(self) -> tuple[int, int]:
+        return self._online_fail_streak, self._online_fail_required
 
     @property
     def stable_country_name(self) -> Optional[str]:
@@ -843,6 +848,7 @@ def load_config(path: Path) -> dict:
 
     config["check_interval_seconds"] = max(1, int(config["check_interval_seconds"]))
     config["request_timeout_seconds"] = max(0.2, float(config["request_timeout_seconds"]))
+    config["connectivity_timeout_seconds"] = max(0.2, float(config["connectivity_timeout_seconds"]))
     service_timeout = config["service_request_timeout_seconds"]
     if "service_request_timeout_seconds" not in custom_config and "chatgpt_request_timeout_seconds" in custom_config:
         service_timeout = config["chatgpt_request_timeout_seconds"]
@@ -1989,8 +1995,12 @@ def run_cycle_checks(
     country_urls: list[str],
 ) -> tuple[bool, Optional[str], Optional[str], Optional[str], dict[str, bool]]:
     timeout = float(config["request_timeout_seconds"])
+    connectivity_timeout = float(config["connectivity_timeout_seconds"])
+    connectivity_attempts = int(config["connectivity_attempts"])
     service_timeout = float(config["service_request_timeout_seconds"])
-    overall_timeout = max(1.0, timeout + 1.0, max_service_timeout(config["service_checks"], service_timeout) + 0.75)
+    connectivity_budget = connectivity_timeout * connectivity_attempts + 0.1 * (connectivity_attempts - 1)
+    overall_timeout = max(1.0, connectivity_budget + 1.0, timeout + 1.0,
+                          max_service_timeout(config["service_checks"], service_timeout) + 0.75)
     defaults = {
         "online": False,
         "country": (None, None, None),
@@ -2002,8 +2012,8 @@ def run_cycle_checks(
         executor.submit(
             check_connectivity,
             urls=config["connectivity_urls"],
-            timeout_seconds=timeout,
-            attempts=int(config["connectivity_attempts"]),
+            timeout_seconds=connectivity_timeout,
+            attempts=connectivity_attempts,
             logger=logger,
         ): ("online", "Connectivity check"),
         executor.submit(
@@ -2112,6 +2122,11 @@ def run_monitor_loop(
                 raw_country_code,
                 raw_service_statuses,
             )
+            if not raw_online:
+                failures, required = debouncer.connectivity_failure_progress
+                logger.info("Сбой проверки интернета: %d/%d; %s", failures, required,
+                            "нет интернета" if debouncer.has_stable_online and not debouncer.stable_online
+                            else "ожидается подтверждение сбоя")
             if not debouncer.has_stable_online:
                 logger.info("No notification. State: warming up connectivity checks.")
                 status_store.set_checking(False)

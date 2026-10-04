@@ -1,4 +1,5 @@
 import copy
+import concurrent.futures
 import logging
 import os
 import socketserver
@@ -24,6 +25,58 @@ def events_for(previous, current):
 
 
 class MonitorStatesTest(unittest.TestCase):
+    def test_internet_outage_requires_consecutive_failures(self):
+        config = main.DEFAULT_CONFIG
+        debouncer = main.StateDebouncer(config["connectivity_success_confirmations"],
+                                        config["connectivity_fail_confirmations"], 1, 1, 1)
+        for raw, expected, failures in ((True, True, 0), (False, True, 1), (True, True, 0),
+                                        (False, True, 1), (False, False, 2)):
+            with self.subTest(raw=raw, failures=failures):
+                debouncer.update(raw, "Germany" if raw else None, "DE" if raw else None, {})
+                self.assertIs(debouncer.stable_online, expected)
+                self.assertEqual(debouncer.connectivity_failure_progress, (failures, 2))
+                current = main.NetworkState(debouncer.stable_online, debouncer.stable_country_name,
+                                            debouncer.stable_country_code, (), datetime.now())
+                self.assertEqual(any(event.event_type == "internet_status" for event in events_for(None, current)),
+                                 not expected)
+                if expected:
+                    self.assertEqual(current.country_code, "DE")
+        debouncer.update(True, "Germany", "DE", {})
+        self.assertTrue(debouncer.stable_online)
+        cold_start = main.StateDebouncer(1, config["connectivity_fail_confirmations"], 1, 1, 1)
+        cold_start.update(False, None, None, {})
+        self.assertFalse(cold_start.has_stable_online)
+        cold_start.update(False, None, None, {})
+        self.assertTrue(cold_start.has_stable_online)
+        self.assertFalse(cold_start.stable_online)
+
+    def test_connectivity_can_wait_longer_than_country_timeout(self):
+        config = copy.deepcopy(main.DEFAULT_CONFIG)
+        config.update(request_timeout_seconds=0.02, connectivity_timeout_seconds=0.2, service_checks=[])
+        config["connectivity_urls"] = [{"url": "https://example.invalid"}]
+        def delayed_response(*_args):
+            time.sleep(0.06)
+            return True, "проверен HTTP 200"
+        with mock.patch("main.check_connectivity_probe", side_effect=delayed_response), \
+                mock.patch("main.fetch_country", return_value=(None, None, None)) as country, \
+                mock.patch("main.check_services", return_value={}):
+            result = main.run_cycle_checks(config, logging.getLogger("test"), [])
+        self.assertTrue(result[0])
+        self.assertEqual(country.call_args.kwargs["timeout_seconds"], 0.02)
+
+    def test_cycle_budget_includes_all_connectivity_attempts(self):
+        config = copy.deepcopy(main.DEFAULT_CONFIG)
+        config["connectivity_attempts"] = 3
+        with mock.patch("main.check_connectivity", return_value=True) as connectivity, \
+                mock.patch("main.fetch_country", return_value=(None, None, None)), \
+                mock.patch("main.check_services", return_value={}), \
+                mock.patch("main.concurrent.futures.wait", wraps=concurrent.futures.wait) as wait:
+            result = main.run_cycle_checks(config, logging.getLogger("test"), [])
+        self.assertTrue(result[0])
+        self.assertEqual(connectivity.call_args.kwargs["timeout_seconds"], 10)
+        self.assertEqual(connectivity.call_args.kwargs["attempts"], 3)
+        self.assertAlmostEqual(wait.call_args.kwargs["timeout"], 31.2)
+
     def test_general_internet_is_independent_of_country_and_services(self):
         config = copy.deepcopy(main.DEFAULT_CONFIG)
         with mock.patch("main.check_connectivity", return_value=False), \

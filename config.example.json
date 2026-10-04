@@ -1,9 +1,10 @@
 {
   "check_interval_seconds": 5,
   "request_timeout_seconds": 3.0,
+  "connectivity_timeout_seconds": 10.0,
   "service_request_timeout_seconds": 8.0,
   "connectivity_success_confirmations": 1,
-  "connectivity_fail_confirmations": 1,
+  "connectivity_fail_confirmations": 2,
   "country_confirmations": 1,
   "service_success_confirmations": 1,
   "service_fail_confirmations": 3,
