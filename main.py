@@ -18,6 +18,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from html.parser import HTMLParser
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
@@ -1103,6 +1104,41 @@ def response_contains_marker(response: requests.Response, marker: str, max_bytes
     return False
 
 
+class PageTextParser(HTMLParser):
+    """Извлекает текст страницы без скриптов, стилей и комментариев."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.ignored_tag: Optional[str] = None
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag in {"script", "style"}:
+            self.ignored_tag = tag
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == self.ignored_tag:
+            self.ignored_tag = None
+
+    def handle_data(self, data: str) -> None:
+        if self.ignored_tag is None:
+            self.parts.append(data)
+
+
+def netology_access_error(body: bytes) -> Optional[str]:
+    parser = PageTextParser()
+    parser.feed(body.decode("utf-8", errors="replace"))
+    text = " ".join(" ".join(parser.parts).casefold().replace("ё", "е").split())
+    if any(marker in text for marker in (
+        "кажется, у вас включен vpn или вы не в россии",
+        "пока платформа недоступна для ip-адресов вне рф",
+    )):
+        return "нет доступа: ограничение VPN или IP вне России"
+    if "извините, у вас нет доступа к данному контенту" in text:
+        return "нет доступа к контенту Нетологии"
+    return None
+
+
 def receive_mtproto_bytes(connection: socket.socket, size: int, deadline: float) -> bytes:
     data = bytearray()
     while len(data) < size:
@@ -1197,6 +1233,7 @@ def check_service_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]
 
     must_contain = probe.get("must_contain")
     parsed_host = urlparse(url).hostname or ""
+    is_netology_check = method == "GET" and (parsed_host == "netology.ru" or parsed_host.endswith(".netology.ru"))
     if not must_contain and method == "GET" and parsed_host in {"chatgpt.com", "www.chatgpt.com"}:
         must_contain = "ChatGPT"
 
@@ -1227,7 +1264,7 @@ def check_service_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]
             timeout=max(0.2, float(timeout_seconds)),
             allow_redirects=not is_api_check,
             headers=headers,
-            stream=is_json_response or bool(must_contain and method == "GET"),
+            stream=is_json_response or bool(must_contain and method == "GET" and not is_netology_check),
             **request_options,
         ) as response:
             if time.monotonic() - started_at >= timeout_seconds:
@@ -1236,6 +1273,11 @@ def check_service_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]
                 return False, f"OpenAI API -> HTTP {response.status_code}"
             if response.status_code < 200 or response.status_code >= 400:
                 return False, f"{method} {url} -> HTTP {response.status_code}"
+
+            if is_netology_check:
+                access_error = netology_access_error(response.content)
+                if access_error:
+                    return False, f"{method} {url} -> HTTP {response.status_code}, {access_error}"
 
             if is_json_response:
                 body = bytearray()

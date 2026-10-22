@@ -28,6 +28,20 @@ class ProbeHandler(BaseHTTPRequestHandler):
             status, body = 403, b"Access denied"
         elif path == "/no-content":
             status, body = 204, b""
+        elif path.startswith("/netology/"):
+            pages = {
+                "vpn": '<h1>Кажется, у&nbsp;вас включён VPN или вы&nbsp;не&nbsp;в&nbsp;России</h1>'
+                       '<p>Пока платформа недоступна для IP-адресов вне&nbsp;РФ и&nbsp;при использовании VPN.</p>'
+                       '<button>Зайти без VPN</button>',
+                "no-access": '<div class="src-LMS-components-Errors-components-NoAccess--header--eyKhM">'
+                             'Извините, у вас нет доступа к данному контенту</div>',
+                "normalized": '<h1>КАЖЕТСЯ, У&#160;ВАС <span>ВКЛЮЧЕН VPN</span> ИЛИ ВЫ\u202fНЕ\nВ РОССИИ</h1>',
+                "allowed": '<h1>Нетология — обучение онлайн</h1><p>Мои курсы</p>',
+                "script-only": '<h1>Нетология — обучение онлайн</h1><script>'
+                               'const error = "Извините, у вас нет доступа к данному контенту";</script>'
+                               '<!-- Кажется, у вас включён VPN или вы не в России -->',
+            }
+            body = pages[path.rsplit("/", 1)[-1]].encode("utf-8")
         elif path == "/v1/models":
             self.server.received_authorization = self.headers.get("Authorization")
             status = getattr(self.server, "api_status", 200)
@@ -116,6 +130,38 @@ class ServiceChecksTest(unittest.TestCase):
                    "probe_urls": [self.probe_for("/longer-than-default")]}
         results = main.check_services([service], 0.2, logging.getLogger("test"))
         self.assertTrue(results["test"])
+
+    def check_netology_page(self, path, host="netology.ru", **probe_options):
+        probe = {"url": f"https://{host}/", "method": "GET", **probe_options}
+        request = main.requests.request
+        local_url = self.probe_for(f"/netology/{path}")["url"]
+        with mock.patch("main.requests.request", side_effect=lambda method, _url, **kwargs:
+                        request(method, local_url, **kwargs)):
+            return main.check_service_probe(probe, 1.0)
+
+    def test_netology_access_pages_are_offline_even_with_http_200(self):
+        for page in ("vpn", "no-access", "normalized"):
+            with self.subTest(page=page):
+                online, detail = self.check_netology_page(page)
+                self.assertFalse(online)
+                self.assertIn("HTTP 200", detail)
+                self.assertIn("доступ", detail)
+
+    def test_netology_subdomains_reject_access_pages(self):
+        self.assertFalse(self.check_netology_page("no-access", host="lms.netology.ru")[0])
+
+    def test_netology_access_page_cannot_pass_a_positive_marker(self):
+        self.assertFalse(self.check_netology_page("vpn", must_contain="VPN")[0])
+
+    def test_netology_normal_pages_and_embedded_error_strings_remain_online(self):
+        for page in ("allowed", "script-only"):
+            with self.subTest(page=page):
+                self.assertTrue(self.check_netology_page(page)[0])
+
+    def test_netology_rule_does_not_change_other_hosts(self):
+        for host in ("example.com", "notnetology.ru", "netology.ru.example.com"):
+            with self.subTest(host=host):
+                self.assertTrue(self.check_netology_page("no-access", host=host)[0])
 
     def test_initialization_failure_is_visible_immediately(self):
         debouncer = main.StateDebouncer(1, 1, 1, 1, 3, {"chatgpt-init": 1})
