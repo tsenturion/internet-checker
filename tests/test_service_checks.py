@@ -35,12 +35,20 @@ class ProbeHandler(BaseHTTPRequestHandler):
                        '<button>Зайти без VPN</button>',
                 "no-access": '<div class="src-LMS-components-Errors-components-NoAccess--header--eyKhM">'
                              'Извините, у вас нет доступа к данному контенту</div>',
+                "type-error": '<h1>Извините, произошла ошибка</h1>'
+                              '<div>TypeError: Cannot read properties of undefined (reading &#39;length&#39;)</div>'
+                              '<a>Вернуться на главную</a> или <button>Перезагрузить страницу</button>',
+                "rate-limit": '<body><h1>429 Too Many Requests</h1>'
+                              'You have sent too many requests in a given amount of time.</body>',
+                "rate-limit-page": '<h1>429 Too Many Requests</h1>',
                 "normalized": '<h1>КАЖЕТСЯ, У&#160;ВАС <span>ВКЛЮЧЕН VPN</span> ИЛИ ВЫ\u202fНЕ\nВ РОССИИ</h1>',
                 "allowed": '<h1>Нетология — обучение онлайн</h1><p>Мои курсы</p>',
                 "script-only": '<h1>Нетология — обучение онлайн</h1><script>'
                                'const error = "Извините, у вас нет доступа к данному контенту";</script>'
                                '<!-- Кажется, у вас включён VPN или вы не в России -->',
             }
+            if path.endswith("/rate-limit"):
+                status = 429
             body = pages[path.rsplit("/", 1)[-1]].encode("utf-8")
         elif path == "/v1/models":
             self.server.received_authorization = self.headers.get("Authorization")
@@ -131,21 +139,42 @@ class ServiceChecksTest(unittest.TestCase):
         results = main.check_services([service], 0.2, logging.getLogger("test"))
         self.assertTrue(results["test"])
 
-    def check_netology_page(self, path, host="netology.ru", **probe_options):
+    def check_netology_page(self, path, host="netology.ru", policy=None, **probe_options):
         probe = {"url": f"https://{host}/", "method": "GET", **probe_options}
         request = main.requests.request
         local_url = self.probe_for(f"/netology/{path}")["url"]
         with mock.patch("main.requests.request", side_effect=lambda method, _url, **kwargs:
                         request(method, local_url, **kwargs)):
-            return main.check_service_probe(probe, 1.0)
+            return main.check_service_probe(probe, 1.0, policy)
 
     def test_netology_access_pages_are_offline_even_with_http_200(self):
-        for page in ("vpn", "no-access", "normalized"):
+        for page in ("vpn", "no-access", "normalized", "type-error"):
             with self.subTest(page=page):
                 online, detail = self.check_netology_page(page)
                 self.assertFalse(online)
                 self.assertIn("HTTP 200", detail)
                 self.assertIn("доступ", detail)
+
+    def test_netology_rate_limit_stops_requests_until_restart(self):
+        for page in ("rate-limit", "rate-limit-page"):
+            with self.subTest(page=page):
+                policy = main.NetologyCheckPolicy(logging.getLogger("test"))
+                with self.assertLogs("test", level="WARNING") as logs:
+                    online, detail = self.check_netology_page(page, policy=policy)
+                self.assertFalse(online)
+                self.assertIn("429", detail)
+                self.assertTrue(policy.paused)
+                self.assertIn("до перезапуска", logs.output[0])
+                with mock.patch("main.requests.request") as request:
+                    self.assertFalse(main.check_service_probe({"url": "https://netology.ru/"}, 1.0, policy)[0])
+                    request.assert_not_called()
+                restarted = main.NetologyCheckPolicy(logging.getLogger("test"))
+                self.assertTrue(self.check_netology_page("allowed", policy=restarted)[0])
+
+    def test_other_http_failures_do_not_pause_netology(self):
+        policy = main.NetologyCheckPolicy(logging.getLogger("test"))
+        self.assertFalse(self.check_netology_page("no-access", policy=policy)[0])
+        self.assertFalse(policy.paused)
 
     def test_netology_subdomains_reject_access_pages(self):
         self.assertFalse(self.check_netology_page("no-access", host="lms.netology.ru")[0])

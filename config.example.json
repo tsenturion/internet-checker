@@ -130,6 +130,7 @@
     {
       "id": "netology",
       "name": "Netology",
+      "fail_confirmations": 1,
       "probe_urls": [
         {
           "url": "https://netology.ru/",

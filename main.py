@@ -55,6 +55,8 @@ except Exception:
 IS_WINDOWS = sys.platform.startswith("win")
 IS_MACOS = sys.platform == "darwin"
 OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
+NETOLOGY_CHECK_INTERVAL_SECONDS = 30 * 60
+NETOLOGY_RATE_LIMIT_ERROR = "нет доступа: HTTP 429 Too Many Requests"
 
 
 DEFAULT_CONFIG = {
@@ -163,6 +165,7 @@ DEFAULT_CONFIG = {
         {
             "id": "netology",
             "name": "Netology",
+            "fail_confirmations": 1,
             "probe_urls": [
                 {"url": "https://netology.ru/", "method": "GET"},
             ],
@@ -415,11 +418,7 @@ class StateDebouncer:
         self._country_candidate_streak = 0
 
     def _update_services(self, raw_service_statuses: dict[str, bool]) -> bool:
-        known_service_ids = set(raw_service_statuses)
-        for service_id in list(self._service_states):
-            if service_id not in known_service_ids:
-                del self._service_states[service_id]
-
+        # Между запланированными проверками сохраняются статус и счётчики сервиса.
         changed = False
         for service_id, raw_online in raw_service_statuses.items():
             service_state = self._service_states.setdefault(service_id, ServiceDebounceState())
@@ -703,6 +702,15 @@ def sanitize_service_id(value: str, fallback: str) -> str:
     return service_id or fallback
 
 
+def is_netology_url(url: str) -> bool:
+    host = urlparse(url).hostname or ""
+    return host == "netology.ru" or host.endswith(".netology.ru")
+
+
+def is_netology_service(service: dict) -> bool:
+    return any(is_netology_url(probe.get("url", "")) for probe in service.get("probe_urls", []))
+
+
 def normalize_service_checks(value: object, default: list[dict]) -> list[dict]:
     if isinstance(value, (str, dict)):
         value = [value]
@@ -769,6 +777,8 @@ def normalize_service_checks(value: object, default: list[dict]) -> list[dict]:
                 service["timeout_seconds"] = max(0.2, float(item["timeout_seconds"]))
             if "fail_confirmations" in item:
                 service["fail_confirmations"] = max(1, int(item["fail_confirmations"]))
+        if is_netology_service(service):
+            service.setdefault("fail_confirmations", 1)
         services.append(service)
 
     return services or copy.deepcopy(default)
@@ -1129,6 +1139,8 @@ def netology_access_error(body: bytes) -> Optional[str]:
     parser = PageTextParser()
     parser.feed(body.decode("utf-8", errors="replace"))
     text = " ".join(" ".join(parser.parts).casefold().replace("ё", "е").split())
+    if "429 too many requests" in text:
+        return NETOLOGY_RATE_LIMIT_ERROR
     if any(marker in text for marker in (
         "кажется, у вас включен vpn или вы не в россии",
         "пока платформа недоступна для ip-адресов вне рф",
@@ -1136,7 +1148,41 @@ def netology_access_error(body: bytes) -> Optional[str]:
         return "нет доступа: ограничение VPN или IP вне России"
     if "извините, у вас нет доступа к данному контенту" in text:
         return "нет доступа к контенту Нетологии"
+    if ("извините, произошла ошибка" in text
+            and "typeerror: cannot read properties of undefined (reading 'length')" in text):
+        return "нет доступа: страница ошибки TypeError Нетологии"
     return None
+
+
+class NetologyCheckPolicy:
+    """Расписание и остановка запросов Нетологии на время текущего запуска."""
+
+    def __init__(self, logger: logging.Logger, clock=time.monotonic) -> None:
+        self.logger = logger
+        self.clock = clock
+        self.next_check_at = 0.0
+        self._paused = threading.Event()
+        self._pause_lock = threading.Lock()
+
+    @property
+    def paused(self) -> bool:
+        return self._paused.is_set()
+
+    def select_services(self, services: list[dict], manual_check: bool = False) -> list[dict]:
+        now = self.clock()
+        due = not self.paused and (manual_check or now >= self.next_check_at)
+        selected = [service for service in services if not is_netology_service(service) or due]
+        if any(is_netology_service(service) for service in selected):
+            self.next_check_at = now + NETOLOGY_CHECK_INTERVAL_SECONDS
+            self.logger.info("Нетология: %s проверка; следующий автоматический запрос не раньше чем через 30 минут",
+                             "ручная" if manual_check else "плановая")
+        return selected
+
+    def pause_until_restart(self) -> None:
+        with self._pause_lock:
+            if not self.paused:
+                self._paused.set()
+                self.logger.warning("Нетология: получен HTTP 429; проверки, включая ручные, остановлены до перезапуска приложения")
 
 
 def receive_mtproto_bytes(connection: socket.socket, size: int, deadline: float) -> bytes:
@@ -1220,7 +1266,9 @@ def check_mtproto_probe(url: str, timeout_seconds: float) -> tuple[bool, str]:
 
 
 @tracked_probe("Сервис")
-def check_service_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]:
+def check_service_probe(
+    probe: dict, timeout_seconds: float, netology_policy: Optional[NetologyCheckPolicy] = None,
+) -> tuple[bool, str]:
     url = probe.get("url", "").strip()
     if not url:
         return False, "empty service probe URL"
@@ -1233,7 +1281,10 @@ def check_service_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]
 
     must_contain = probe.get("must_contain")
     parsed_host = urlparse(url).hostname or ""
-    is_netology_check = method == "GET" and (parsed_host == "netology.ru" or parsed_host.endswith(".netology.ru"))
+    netology_host = is_netology_url(url)
+    is_netology_check = method == "GET" and netology_host
+    if netology_host and netology_policy is not None and netology_policy.paused:
+        return False, "Нетология: проверки остановлены после HTTP 429 до перезапуска приложения"
     if not must_contain and method == "GET" and parsed_host in {"chatgpt.com", "www.chatgpt.com"}:
         must_contain = "ChatGPT"
 
@@ -1267,6 +1318,10 @@ def check_service_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]
             stream=is_json_response or bool(must_contain and method == "GET" and not is_netology_check),
             **request_options,
         ) as response:
+            if netology_host and response.status_code == 429:
+                if netology_policy is not None:
+                    netology_policy.pause_until_restart()
+                return False, f"{method} {url} -> {NETOLOGY_RATE_LIMIT_ERROR}"
             if time.monotonic() - started_at >= timeout_seconds:
                 return False, f"{method} {url} -> превышен лимит {timeout_seconds:g} с"
             if is_api_check and response.status_code != 200:
@@ -1277,6 +1332,8 @@ def check_service_probe(probe: dict, timeout_seconds: float) -> tuple[bool, str]
             if is_netology_check:
                 access_error = netology_access_error(response.content)
                 if access_error:
+                    if access_error == NETOLOGY_RATE_LIMIT_ERROR and netology_policy is not None:
+                        netology_policy.pause_until_restart()
                     return False, f"{method} {url} -> HTTP {response.status_code}, {access_error}"
 
             if is_json_response:
@@ -1462,6 +1519,7 @@ def check_service(
     timeout_seconds: float,
     logger: Optional[logging.Logger] = None,
     service_name: str = "",
+    netology_policy: Optional[NetologyCheckPolicy] = None,
 ) -> bool:
     if not probes:
         return False
@@ -1472,7 +1530,7 @@ def check_service(
         thread_name_prefix="service-probe",
     )
     futures = [
-        executor.submit(check_service_probe, probe, timeout_seconds)
+        executor.submit(check_service_probe, probe, timeout_seconds, netology_policy)
         for probe in probes
         if probe.get("url")
     ]
@@ -1500,7 +1558,10 @@ def max_service_timeout(service_checks: list[dict], default_timeout: float) -> f
     return max([default_timeout] + [float(service.get("timeout_seconds", default_timeout)) for service in service_checks])
 
 
-def check_services(service_checks: list[dict], timeout_seconds: float, logger: logging.Logger) -> dict[str, bool]:
+def check_services(
+    service_checks: list[dict], timeout_seconds: float, logger: logging.Logger,
+    netology_policy: Optional[NetologyCheckPolicy] = None,
+) -> dict[str, bool]:
     if not service_checks:
         return {}
 
@@ -1516,6 +1577,7 @@ def check_services(service_checks: list[dict], timeout_seconds: float, logger: l
             float(service.get("timeout_seconds", timeout_seconds)),
             logger,
             service["name"],
+            netology_policy,
         ): service
         for service in service_checks
     }
@@ -2018,7 +2080,6 @@ def wait_for_next_cycle(
     deadline = time.monotonic() + max(1, int(interval_seconds))
     while not stop_event.is_set() and time.monotonic() < deadline:
         if check_now_event is not None and check_now_event.is_set():
-            check_now_event.clear()
             return
         time.sleep(0.1)
 
@@ -2035,18 +2096,23 @@ def run_cycle_checks(
     config: dict,
     logger: logging.Logger,
     country_urls: list[str],
+    netology_policy: Optional[NetologyCheckPolicy] = None,
+    manual_check: bool = False,
 ) -> tuple[bool, Optional[str], Optional[str], Optional[str], dict[str, bool]]:
     timeout = float(config["request_timeout_seconds"])
     connectivity_timeout = float(config["connectivity_timeout_seconds"])
     connectivity_attempts = int(config["connectivity_attempts"])
     service_timeout = float(config["service_request_timeout_seconds"])
+    service_checks = config["service_checks"]
+    if netology_policy is not None:
+        service_checks = netology_policy.select_services(service_checks, manual_check)
     connectivity_budget = connectivity_timeout * connectivity_attempts + 0.1 * (connectivity_attempts - 1)
     overall_timeout = max(1.0, connectivity_budget + 1.0, timeout + 1.0,
-                          max_service_timeout(config["service_checks"], service_timeout) + 0.75)
+                          max_service_timeout(service_checks, service_timeout) + 0.75)
     defaults = {
         "online": False,
         "country": (None, None, None),
-        "services": {service["id"]: False for service in config["service_checks"]},
+        "services": {service["id"]: False for service in service_checks},
     }
     results = dict(defaults)
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="monitor-cycle")
@@ -2067,9 +2133,10 @@ def run_cycle_checks(
         ): ("country", "Country lookup"),
         executor.submit(
             check_services,
-            service_checks=config["service_checks"],
+            service_checks=service_checks,
             timeout_seconds=service_timeout,
             logger=logger,
+            netology_policy=netology_policy,
         ): ("services", "Service checks"),
     }
 
@@ -2102,6 +2169,7 @@ def run_monitor_loop(
     check_now_event: Optional[threading.Event],
 ) -> None:
     notifier = Notifier("Internet Checker")
+    netology_policy = NetologyCheckPolicy(logger)
     debouncer = StateDebouncer(
         online_success=int(config["connectivity_success_confirmations"]),
         online_fail=int(config["connectivity_fail_confirmations"]),
@@ -2140,6 +2208,7 @@ def run_monitor_loop(
         while not stop_event.is_set():
             now = datetime.now()
             now_ts = time.time()
+            manual_check = check_now_event is not None and check_now_event.is_set()
             if check_now_event is not None:
                 check_now_event.clear()
             status_store.set_checking(True)
@@ -2152,6 +2221,8 @@ def run_monitor_loop(
                 config=config,
                 logger=logger,
                 country_urls=country_urls,
+                netology_policy=netology_policy,
+                manual_check=manual_check,
             )
 
             if country_source and country_source != last_country_source:
@@ -2181,9 +2252,12 @@ def run_monitor_loop(
                 ServiceStatus(
                     service_id=service["id"],
                     name=service["name"],
-                    online=debouncer.stable_service_online(service["id"]),
+                    online=(False if is_netology_service(service) and netology_policy.paused
+                            else debouncer.stable_service_online(service["id"])),
                     detail=("ключ не указан" if service["id"] == "openai-api"
-                            and not os.environ.get("OPENAI_API_KEY", "").strip() else ""),
+                            and not os.environ.get("OPENAI_API_KEY", "").strip() else
+                            "HTTP 429: проверки остановлены до перезапуска" if is_netology_service(service)
+                            and netology_policy.paused else ""),
                     notify=bool(service.get("notify", True)) and service["id"] != "openai-api",
                 )
                 for service in config["service_checks"]
