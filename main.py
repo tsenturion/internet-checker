@@ -204,6 +204,7 @@ class NetworkState:
     country_code: Optional[str]
     service_statuses: tuple[ServiceStatus, ...]
     checked_at: datetime
+    office_country_warning: str = ""
 
 
 @dataclass
@@ -2050,6 +2051,8 @@ def tray_status_lines(snapshot: StatusSnapshot) -> list[str]:
     lines = [(state.country_name or state.country_code or "Страна неизвестна") if state.online else "Нет интернета"]
     lines.extend(service_status_text(service) for service in group_service_statuses(state.service_statuses)
                  if service.online is False)
+    if state.office_country_warning:
+        lines.append(state.office_country_warning)
     lines.append(f"Обновлено: {checked_at}")
     if snapshot.checking:
         lines.append("Проверка: выполняется")
@@ -2160,6 +2163,35 @@ def run_cycle_checks(
     return raw_online, raw_country_name, raw_country_code, country_source, raw_service_statuses
 
 
+def check_office_country(logger: logging.Logger) -> str:
+    if not IS_WINDOWS:
+        return ""
+
+    import winreg
+
+    path = r"Software\Microsoft\Office\16.0\Common\ExperimentConfigs\Ecs"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_READ) as key:
+            value, value_type = winreg.QueryValueEx(key, "CountryCode")
+    except FileNotFoundError:
+        logger.info("Office: значение CountryCode не найдено.")
+        return ""
+    except OSError as exc:
+        logger.warning("Office: не удалось прочитать CountryCode (%s).", type(exc).__name__)
+        return ""
+
+    country = value.strip().removeprefix("std::wstring|").strip().upper() if isinstance(value, str) else ""
+    if value_type != winreg.REG_SZ or len(country) != 2 or not country.isascii() or not country.isalpha():
+        logger.warning("Office: неизвестный формат CountryCode.")
+        return ""
+    if country == "RU":
+        warning = "Office: CountryCode указывает на Россию (RU)"
+        logger.warning("%s.", warning)
+        return warning
+    logger.info("Office: CountryCode = %s.", country)
+    return ""
+
+
 def run_monitor_loop(
     config: dict,
     logger: logging.Logger,
@@ -2192,6 +2224,7 @@ def run_monitor_loop(
     last_country_source: Optional[str] = None
 
     logger.info("Internet checker started.")
+    office_country_warning = check_office_country(logger)
     if bool(config.get("show_app_started_notification", True)):
         try:
             notify(
@@ -2268,6 +2301,7 @@ def run_monitor_loop(
                 country_code=debouncer.stable_country_code if debouncer.stable_online else None,
                 service_statuses=group_service_statuses(service_statuses),
                 checked_at=now,
+                office_country_warning=office_country_warning,
             )
             status_store.set_state(current_state)
             notification_policy.observe_state(current_state)
