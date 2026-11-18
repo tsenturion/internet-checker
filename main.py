@@ -57,6 +57,7 @@ IS_MACOS = sys.platform == "darwin"
 OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
 NETOLOGY_CHECK_INTERVAL_SECONDS = 30 * 60
 NETOLOGY_RATE_LIMIT_ERROR = "нет доступа: HTTP 429 Too Many Requests"
+OFFICE_COUNTRY_KEY = r"Software\Microsoft\Office\16.0\Common\ExperimentConfigs\Ecs"
 
 
 DEFAULT_CONFIG = {
@@ -2163,32 +2164,44 @@ def run_cycle_checks(
     return raw_online, raw_country_name, raw_country_code, country_source, raw_service_statuses
 
 
-def check_office_country(logger: logging.Logger) -> str:
+def sync_office_country(country_code: Optional[str], logger: logging.Logger) -> str:
     if not IS_WINDOWS:
         return ""
 
     import winreg
 
-    path = r"Software\Microsoft\Office\16.0\Common\ExperimentConfigs\Ecs"
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_READ) as key:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, OFFICE_COUNTRY_KEY, 0, winreg.KEY_QUERY_VALUE) as key:
             value, value_type = winreg.QueryValueEx(key, "CountryCode")
     except FileNotFoundError:
-        logger.info("Office: значение CountryCode не найдено.")
         return ""
     except OSError as exc:
-        logger.warning("Office: не удалось прочитать CountryCode (%s).", type(exc).__name__)
+        return f"Не удалось прочитать CountryCode Office ({type(exc).__name__})"
+
+    if value_type != winreg.REG_SZ or not isinstance(value, str):
+        return ""
+    if value.strip().removeprefix("std::wstring|").strip().upper() != "RU":
         return ""
 
-    country = value.strip().removeprefix("std::wstring|").strip().upper() if isinstance(value, str) else ""
-    if value_type != winreg.REG_SZ or len(country) != 2 or not country.isascii() or not country.isalpha():
-        logger.warning("Office: неизвестный формат CountryCode.")
+    code = (country_code or "").strip().upper()
+    if code == "RU":
+        return "В Office сохранён RU. Текущая страна подключения — Россия"
+    if len(code) != 2 or not code.isascii() or not code.isalpha() or code in {"XX", "ZZ"}:
+        return "В Office сохранён RU. Не удалось определить код текущей страны подключения"
+
+    try:
+        access = winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, OFFICE_COUNTRY_KEY, 0, access) as key:
+            # Office мог изменить значение после первого чтения.
+            if winreg.QueryValueEx(key, "CountryCode") != (value, value_type):
+                return ""
+            winreg.SetValueEx(key, "CountryCode", 0, winreg.REG_SZ, f"std::wstring|{code}")
+    except FileNotFoundError:
         return ""
-    if country == "RU":
-        warning = "Office: CountryCode указывает на Россию (RU)"
-        logger.warning("%s.", warning)
-        return warning
-    logger.info("Office: CountryCode = %s.", country)
+    except OSError as exc:
+        return f"Не удалось заменить RU в CountryCode Office ({type(exc).__name__})"
+
+    logger.info("Office: CountryCode изменён с RU на %s.", code)
     return ""
 
 
@@ -2222,9 +2235,9 @@ def run_monitor_loop(
 
     previous_state: Optional[NetworkState] = None
     last_country_source: Optional[str] = None
+    office_country_warning = ""
 
     logger.info("Internet checker started.")
-    office_country_warning = check_office_country(logger)
     if bool(config.get("show_app_started_notification", True)):
         try:
             notify(
@@ -2261,6 +2274,11 @@ def run_monitor_loop(
             if country_source and country_source != last_country_source:
                 logger.info("Country API source selected: %s", country_source)
                 last_country_source = country_source
+
+            warning = sync_office_country(raw_country_code, logger)
+            if warning and warning != office_country_warning:
+                logger.warning("%s", warning)
+            office_country_warning = warning
 
             debouncer.update(
                 raw_online,
