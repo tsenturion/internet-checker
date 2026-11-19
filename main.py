@@ -58,6 +58,9 @@ OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
 NETOLOGY_CHECK_INTERVAL_SECONDS = 30 * 60
 NETOLOGY_RATE_LIMIT_ERROR = "нет доступа: HTTP 429 Too Many Requests"
 OFFICE_COUNTRY_KEY = r"Software\Microsoft\Office\16.0\Common\ExperimentConfigs\Ecs"
+INTERNET_CHECK = "system:internet"
+COUNTRY_CHECK = "system:country"
+OFFICE_CHECK = "system:office"
 
 
 DEFAULT_CONFIG = {
@@ -200,12 +203,13 @@ class ServiceStatus:
 
 @dataclass
 class NetworkState:
-    online: bool
+    online: Optional[bool]
     country_name: Optional[str]
     country_code: Optional[str]
     service_statuses: tuple[ServiceStatus, ...]
     checked_at: datetime
     office_country_warning: str = ""
+    country_check_enabled: bool = True
 
 
 @dataclass
@@ -432,9 +436,17 @@ class StateDebouncer:
                 changed = True
         return changed
 
+    def reset_service(self, service_id: str) -> None:
+        self._service_states.pop(service_id, None)
+
+    def reset_country(self) -> None:
+        self._stable_country_name = None
+        self._stable_country_code = None
+        self._reset_country_candidate()
+
     def update(
         self,
-        raw_online: bool,
+        raw_online: Optional[bool],
         raw_country_name: Optional[str],
         raw_country_code: Optional[str],
         raw_service_statuses: dict[str, bool],
@@ -445,14 +457,18 @@ class StateDebouncer:
         country_changed = False
         services_changed = self._update_services(raw_service_statuses)
 
-        if raw_online:
+        if raw_online is None:
+            self._stable_online = None
+            self._online_success_streak = 0
+            self._online_fail_streak = 0
+        elif raw_online:
             self._online_success_streak += 1
             self._online_fail_streak = 0
         else:
             self._online_fail_streak += 1
             self._online_success_streak = 0
 
-        if self._stable_online is None:
+        if raw_online is not None and self._stable_online is None:
             if raw_online and self._online_success_streak >= self._online_success_required:
                 self._stable_online = True
             elif not raw_online and self._online_fail_streak >= self._online_fail_required:
@@ -463,17 +479,15 @@ class StateDebouncer:
                     country_changed=False,
                     services_changed=services_changed,
                 )
-        elif self._stable_online and not raw_online and self._online_fail_streak >= self._online_fail_required:
+        elif self._stable_online and raw_online is False and self._online_fail_streak >= self._online_fail_required:
             self._stable_online = False
             online_changed = True
-        elif not self._stable_online and raw_online and self._online_success_streak >= self._online_success_required:
+        elif self._stable_online is False and raw_online and self._online_success_streak >= self._online_success_required:
             self._stable_online = True
             online_changed = True
 
-        if not self._stable_online:
-            self._stable_country_name = None
-            self._stable_country_code = None
-            self._reset_country_candidate()
+        if self._stable_online is False:
+            self.reset_country()
             return DebounceUpdate(
                 online_changed=online_changed,
                 country_changed=False,
@@ -562,7 +576,7 @@ class NotificationPolicy:
 
     def observe_state(self, state: NetworkState) -> None:
         before = self._active_outages.copy()
-        if state.online:
+        if state.online is True:
             self._active_outages.discard("internet_status:offline")
         for service in state.service_statuses:
             if service.online is True or not service.notify:
@@ -602,6 +616,29 @@ class NotificationPolicy:
             self._last_by_fingerprint[event.fingerprint] = now_ts
             self._cleanup(now_ts)
         return True, None
+
+
+class CheckPreferences:
+    """Сохраняет выключенные проверки отдельно от конфигурации адресов."""
+
+    def __init__(self, path: Path, logger: logging.Logger) -> None:
+        self.path = path
+        self.disabled: frozenset[str] = frozenset()
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(saved, list) or not all(isinstance(item, str) for item in saved):
+                raise ValueError("Ожидался список идентификаторов проверок")
+            self.disabled = frozenset(saved)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            logger.exception("Не удалось загрузить настройки проверок")
+
+    def save(self, disabled: frozenset[str]) -> None:
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(sorted(disabled), ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(self.path)
+        self.disabled = disabled
 
 
 class StatusStore:
@@ -1602,7 +1639,7 @@ def check_services(
 
 
 def offline_services(state: NetworkState) -> list[ServiceStatus]:
-    if not state.online:
+    if state.online is False:
         return []
     return [service for service in state.service_statuses if service.online is False]
 
@@ -1610,16 +1647,18 @@ def offline_services(state: NetworkState) -> list[ServiceStatus]:
 def group_service_statuses(statuses: tuple[ServiceStatus, ...]) -> tuple[ServiceStatus, ...]:
     by_id = {service.service_id: service for service in statuses}
     site, initialization = by_id.get("chatgpt"), by_id.get("chatgpt-init")
-    if site is None or initialization is None:
+    if initialization is None and (site is None or site.components):
         return statuses
-    combined = False if False in (site.online, initialization.online) else (
-        True if site.online is True and initialization.online is True else None
-    )
-    grouped = ServiceStatus("chatgpt", "ChatGPT", combined,
-                            (("сайт", site.online), ("ab.chatgpt.com", initialization.online)),
-                            notify=site.notify or initialization.notify)
-    return tuple(grouped if service.service_id == "chatgpt" else service
-                 for service in statuses if service.service_id != "chatgpt-init")
+    parts = [(label, service) for label, service in (("сайт", site), ("ab.chatgpt.com", initialization))
+             if service is not None]
+    components = tuple((label, service.online) for label, service in parts)
+    values = [online for _, online in components]
+    combined = False if False in values else (True if all(value is True for value in values) else None)
+    grouped = ServiceStatus("chatgpt", "ChatGPT", combined, components,
+                            notify=any(service.notify for _, service in parts))
+    first_part_id = (site or initialization).service_id
+    return tuple(grouped if service.service_id == first_part_id else service
+                 for service in statuses if service.service_id != "chatgpt-init" or site is None)
 
 
 def service_status_text(service: ServiceStatus) -> str:
@@ -1640,8 +1679,19 @@ def service_status_map(state: NetworkState) -> dict[str, ServiceStatus]:
     return {service.service_id: service for service in state.service_statuses}
 
 
+def connection_status_text(state: NetworkState) -> str:
+    if state.online is False:
+        return "Нет интернета"
+    country = state.country_name or state.country_code or "Страна неизвестна"
+    if not state.country_check_enabled:
+        country = "Проверка страны отключена"
+    if state.online is None:
+        return f"Проверка интернета отключена · {country}"
+    return country
+
+
 def snapshot_text(state: NetworkState) -> str:
-    connection = (state.country_name or state.country_code or "Страна неизвестна") if state.online else "Нет интернета"
+    connection = connection_status_text(state)
     services = service_summary(state)
     return f"{connection} | {services}" if services else connection
 
@@ -1684,7 +1734,7 @@ def collect_events(
     russia_names: set[str],
 ) -> list[NotificationEvent]:
     events: list[NotificationEvent] = []
-    if not current.online:
+    if current.online is False:
         return [NotificationEvent("internet_status", "Нет интернета", "internet_status:offline")]
     if notify_on_service_status_change:
         for service in group_service_statuses(current.service_statuses):
@@ -1712,7 +1762,7 @@ def collect_events(
         prev_is_russia = is_russia_country(prev.country_name, prev.country_code, russia_codes, russia_names)
         current_is_russia = is_russia_country(current.country_name, current.country_code, russia_codes, russia_names)
 
-    if current.online and prev_country_key != current_country_key:
+    if current.country_check_enabled and prev.country_check_enabled and prev_country_key != current_country_key:
         if notify_only_russia_transitions and not (prev_is_russia or current_is_russia):
             return events
 
@@ -1788,7 +1838,7 @@ def open_path(path: Path) -> None:
 
 def tray_all_online(snapshot: StatusSnapshot) -> bool:
     state = snapshot.state
-    return bool(state is not None and not snapshot.last_error and state.online
+    return bool(state is not None and not snapshot.last_error and state.online is not False
                 and all(service.online is True for service in state.service_statuses))
 
 
@@ -1817,6 +1867,7 @@ class TrayPopupController:
         check_now_event: threading.Event,
         stop_event: threading.Event,
         traffic_collector: TrafficCollector,
+        check_preferences: CheckPreferences,
     ) -> None:
         self._config = config
         self._logger = logger
@@ -1824,7 +1875,9 @@ class TrayPopupController:
         self._check_now_event = check_now_event
         self._stop_event = stop_event
         self._traffic_collector = traffic_collector
+        self._check_preferences = check_preferences
         self._metrics_window = None
+        self._checks_window: Optional[tk.Toplevel] = None
         self._commands: queue.Queue[str] = queue.Queue()
         self._ready = threading.Event()
         self._root: Optional[tk.Tk] = None
@@ -1890,6 +1943,7 @@ class TrayPopupController:
         self._separator(body)
         self._menu_button(body, str(self._config["tray_show_status_label"]), self._show_status_notification)
         self._menu_button(body, str(self._config["tray_check_now_label"]), self._check_now)
+        self._menu_button(body, "Настройки проверок…", self._show_check_settings)
         self._menu_button(body, "Использование сети…", self._show_network_metrics)
         self._menu_button(body, str(self._config["tray_open_log_label"]), self._open_log)
         self._separator(body)
@@ -2019,6 +2073,68 @@ class TrayPopupController:
         except Exception:
             self._logger.exception("Не удалось открыть окно использования сети")
 
+    def _show_check_settings(self) -> None:
+        from tkinter import ttk
+
+        self._hide_popup()
+        if self._root is None:
+            return
+        if self._checks_window is not None and self._checks_window.winfo_exists():
+            self._checks_window.lift()
+            self._checks_window.focus_force()
+            return
+
+        window = tk.Toplevel(self._root)
+        self._checks_window = window
+        window.title("Настройки проверок")
+        window.bind("<Escape>", lambda _event: window.destroy())
+        body = ttk.Frame(window, padding=16)
+        body.pack(fill="both", expand=True)
+        groups = [("Подключение", [(INTERNET_CHECK, "Доступность интернета"),
+                                   (COUNTRY_CHECK, "Страна подключения")])]
+        if IS_WINDOWS:
+            groups[0][1].append((OFFICE_CHECK, "Исправление CountryCode в Office"))
+        service_names = {"chatgpt": "Сайт ChatGPT", "chatgpt-init": "Инициализация ChatGPT (ab.chatgpt.com)"}
+        services = [(f"service:{service['id']}", service_names.get(service["id"], service["name"]))
+                    for service in self._config["service_checks"]]
+        if services:
+            groups.append(("Сервисы", services))
+
+        enabled = {}
+        for title, checks in groups:
+            group = ttk.LabelFrame(body, text=title, padding=(10, 6))
+            group.pack(fill="x", pady=(0, 8))
+            for check_id, label in checks:
+                option = tk.BooleanVar(window, value=check_id not in self._check_preferences.disabled)
+                enabled[check_id] = option
+                ttk.Checkbutton(group, text=label, variable=option).pack(anchor="w", pady=2)
+            if IS_WINDOWS and title == "Подключение":
+                ttk.Label(group, text="Исправление Office требует определения страны.").pack(anchor="w", pady=(4, 0))
+        ttk.Label(body, text="Изменения применяются со следующего цикла.").pack(anchor="w", pady=(0, 8))
+        error = ttk.Label(body, text="", foreground="#a61212")
+
+        def save() -> None:
+            previous = self._check_preferences.disabled
+            disabled = previous.difference(enabled).union(check for check, option in enabled.items()
+                                                         if not option.get())
+            if disabled != previous:
+                try:
+                    self._check_preferences.save(disabled)
+                except OSError:
+                    self._logger.exception("Не удалось сохранить настройки проверок")
+                    error.configure(text="Не удалось сохранить настройки. Попробуйте ещё раз.")
+                    error.pack(anchor="w", pady=4)
+                    return
+                self._logger.info("Настройки проверок сохранены. Отключены: %s",
+                                  ", ".join(sorted(disabled)) or "нет")
+            window.destroy()
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Сохранить", command=save).pack(side="right")
+        ttk.Button(buttons, text="Отмена", command=window.destroy).pack(side="right", padx=(0, 8))
+        window.focus_force()
+
     def _exit_app(self) -> None:
         self._logger.info("Tray exit requested.")
         self._stop_event.set()
@@ -2049,7 +2165,7 @@ def tray_status_lines(snapshot: StatusSnapshot) -> list[str]:
 
     state = snapshot.state
     checked_at = state.checked_at.strftime("%H:%M:%S")
-    lines = [(state.country_name or state.country_code or "Страна неизвестна") if state.online else "Нет интернета"]
+    lines = [connection_status_text(state)]
     lines.extend(service_status_text(service) for service in group_service_statuses(state.service_statuses)
                  if service.online is False)
     if state.office_country_warning:
@@ -2102,7 +2218,10 @@ def run_cycle_checks(
     country_urls: list[str],
     netology_policy: Optional[NetologyCheckPolicy] = None,
     manual_check: bool = False,
-) -> tuple[bool, Optional[str], Optional[str], Optional[str], dict[str, bool]]:
+    *,
+    check_internet: bool = True,
+    check_country: bool = True,
+) -> tuple[Optional[bool], Optional[str], Optional[str], Optional[str], dict[str, bool]]:
     timeout = float(config["request_timeout_seconds"])
     connectivity_timeout = float(config["connectivity_timeout_seconds"])
     connectivity_attempts = int(config["connectivity_attempts"])
@@ -2111,38 +2230,44 @@ def run_cycle_checks(
     if netology_policy is not None:
         service_checks = netology_policy.select_services(service_checks, manual_check)
     connectivity_budget = connectivity_timeout * connectivity_attempts + 0.1 * (connectivity_attempts - 1)
-    overall_timeout = max(1.0, connectivity_budget + 1.0, timeout + 1.0,
-                          max_service_timeout(service_checks, service_timeout) + 0.75)
+    overall_timeout = max(1.0, connectivity_budget + 1.0 if check_internet else 0.0,
+                          timeout + 1.0 if check_country else 0.0,
+                          max_service_timeout(service_checks, service_timeout) + 0.75 if service_checks else 0.0)
     defaults = {
-        "online": False,
+        "online": False if check_internet else None,
         "country": (None, None, None),
         "services": {service["id"]: False for service in service_checks},
     }
     results = dict(defaults)
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="monitor-cycle")
-    future_map = {
-        executor.submit(
+    future_map = {}
+    if check_internet:
+        future = executor.submit(
             check_connectivity,
             urls=config["connectivity_urls"],
             timeout_seconds=connectivity_timeout,
             attempts=connectivity_attempts,
             logger=logger,
-        ): ("online", "Connectivity check"),
-        executor.submit(
+        )
+        future_map[future] = ("online", "Connectivity check")
+    if check_country:
+        future = executor.submit(
             fetch_country,
             urls=country_urls,
             timeout_seconds=timeout,
             logger=logger,
             no_cache=bool(config.get("country_lookup_no_cache", True)),
-        ): ("country", "Country lookup"),
-        executor.submit(
+        )
+        future_map[future] = ("country", "Country lookup")
+    if service_checks:
+        future = executor.submit(
             check_services,
             service_checks=service_checks,
             timeout_seconds=service_timeout,
             logger=logger,
             netology_policy=netology_policy,
-        ): ("services", "Service checks"),
-    }
+        )
+        future_map[future] = ("services", "Service checks")
 
     try:
         done, pending = concurrent.futures.wait(future_map, timeout=overall_timeout)
@@ -2157,11 +2282,8 @@ def run_cycle_checks(
         executor.shutdown(wait=False, cancel_futures=True)
 
     raw_country_name, raw_country_code, country_source = results["country"]
-    raw_connectivity_online = bool(results["online"])
-    raw_service_statuses = dict(results["services"])
-    raw_online = raw_connectivity_online
-
-    return raw_online, raw_country_name, raw_country_code, country_source, raw_service_statuses
+    raw_online = bool(results["online"]) if check_internet else None
+    return raw_online, raw_country_name, raw_country_code, country_source, dict(results["services"])
 
 
 def sync_office_country(country_code: Optional[str], logger: logging.Logger) -> str:
@@ -2195,13 +2317,16 @@ def sync_office_country(country_code: Optional[str], logger: logging.Logger) -> 
             # Office мог изменить значение после первого чтения.
             if winreg.QueryValueEx(key, "CountryCode") != (value, value_type):
                 return ""
-            winreg.SetValueEx(key, "CountryCode", 0, winreg.REG_SZ, f"std::wstring|{code}")
+            new_value = f"std::wstring|{code}"
+            winreg.SetValueEx(key, "CountryCode", 0, winreg.REG_SZ, new_value)
+            if winreg.QueryValueEx(key, "CountryCode") != (new_value, winreg.REG_SZ):
+                return "Не удалось подтвердить запись CountryCode в реестре Windows"
     except FileNotFoundError:
         return ""
     except OSError as exc:
         return f"Не удалось заменить RU в CountryCode Office ({type(exc).__name__})"
 
-    logger.info("Office: CountryCode изменён с RU на %s.", code)
+    logger.info("Office: замена CountryCode с RU на %s подтверждена чтением HKCU.", code)
     return ""
 
 
@@ -2212,6 +2337,7 @@ def run_monitor_loop(
     run_once: bool,
     status_store: StatusStore,
     check_now_event: Optional[threading.Event],
+    check_preferences: Optional[CheckPreferences] = None,
 ) -> None:
     notifier = Notifier("Internet Checker")
     netology_policy = NetologyCheckPolicy(logger)
@@ -2259,23 +2385,38 @@ def run_monitor_loop(
                 check_now_event.clear()
             status_store.set_checking(True)
 
-            country_urls = list(config["country_lookup_urls"])
+            disabled = check_preferences.disabled if check_preferences is not None else frozenset()
+            country_enabled = COUNTRY_CHECK not in disabled
+            country_urls = list(config["country_lookup_urls"]) if country_enabled else []
+            if not country_enabled:
+                debouncer.reset_country()
+                last_country_source = None
             if last_country_source and last_country_source in country_urls:
                 country_urls = [last_country_source] + [url for url in country_urls if url != last_country_source]
 
+            enabled_services = []
+            for service in config["service_checks"]:
+                if f"service:{service['id']}" in disabled:
+                    debouncer.reset_service(service["id"])
+                else:
+                    enabled_services.append(service)
+
             raw_online, raw_country_name, raw_country_code, country_source, raw_service_statuses = run_cycle_checks(
-                config=config,
+                config={**config, "service_checks": enabled_services},
                 logger=logger,
                 country_urls=country_urls,
                 netology_policy=netology_policy,
                 manual_check=manual_check,
+                check_internet=INTERNET_CHECK not in disabled,
+                check_country=country_enabled,
             )
 
             if country_source and country_source != last_country_source:
                 logger.info("Country API source selected: %s", country_source)
                 last_country_source = country_source
 
-            warning = sync_office_country(raw_country_code, logger)
+            office_enabled = country_enabled and OFFICE_CHECK not in disabled
+            warning = sync_office_country(raw_country_code, logger) if office_enabled else ""
             if warning and warning != office_country_warning:
                 logger.warning("%s", warning)
             office_country_warning = warning
@@ -2286,12 +2427,12 @@ def run_monitor_loop(
                 raw_country_code,
                 raw_service_statuses,
             )
-            if not raw_online:
+            if raw_online is False:
                 failures, required = debouncer.connectivity_failure_progress
                 logger.info("Сбой проверки интернета: %d/%d; %s", failures, required,
                             "нет интернета" if debouncer.has_stable_online and not debouncer.stable_online
                             else "ожидается подтверждение сбоя")
-            if not debouncer.has_stable_online:
+            if raw_online is not None and not debouncer.has_stable_online:
                 logger.info("No notification. State: warming up connectivity checks.")
                 status_store.set_checking(False)
                 if run_once:
@@ -2311,15 +2452,17 @@ def run_monitor_loop(
                             and netology_policy.paused else ""),
                     notify=bool(service.get("notify", True)) and service["id"] != "openai-api",
                 )
-                for service in config["service_checks"]
+                for service in enabled_services
             )
+            online = None if raw_online is None else debouncer.stable_online
             current_state = NetworkState(
-                online=debouncer.stable_online,
-                country_name=debouncer.stable_country_name if debouncer.stable_online else None,
-                country_code=debouncer.stable_country_code if debouncer.stable_online else None,
+                online=online,
+                country_name=debouncer.stable_country_name if online is not False else None,
+                country_code=debouncer.stable_country_code if online is not False else None,
                 service_statuses=group_service_statuses(service_statuses),
                 checked_at=now,
                 office_country_warning=office_country_warning,
+                country_check_enabled=country_enabled,
             )
             status_store.set_state(current_state)
             notification_policy.observe_state(current_state)
@@ -2382,6 +2525,7 @@ def run_with_tray(
     status_store: StatusStore,
     check_now_event: threading.Event,
     traffic_collector: TrafficCollector,
+    check_preferences: CheckPreferences,
 ) -> None:
     popup_controller = TrayPopupController(
         config=config,
@@ -2390,6 +2534,7 @@ def run_with_tray(
         check_now_event=check_now_event,
         stop_event=stop_event,
         traffic_collector=traffic_collector,
+        check_preferences=check_preferences,
     )
     initial_snapshot = status_store.snapshot()
     initial_online = tray_all_online(initial_snapshot)
@@ -2499,6 +2644,7 @@ def main() -> None:
         load_dotenv(data_dir / ".env", override=False, interpolate=False)
 
         logger = setup_logging(config)
+        check_preferences = CheckPreferences(data_dir / "check-settings.json", logger)
         labels = {urlparse(probe["url"]).hostname: service["name"]
                   for service in config["service_checks"] for probe in service["probe_urls"]}
         traffic_collector = TrafficCollector(data_dir / "network-metrics.json", labels, logger)
@@ -2519,6 +2665,7 @@ def main() -> None:
                 run_once=args.once,
                 status_store=status_store,
                 check_now_event=check_now_event,
+                check_preferences=check_preferences,
             )
         elif not tray_supported():
             logger.warning("Tray UI is unavailable on this platform/session. Running without tray.")
@@ -2529,6 +2676,7 @@ def main() -> None:
                 run_once=False,
                 status_store=status_store,
                 check_now_event=check_now_event,
+                check_preferences=check_preferences,
             )
         else:
             monitor_thread = threading.Thread(
@@ -2540,6 +2688,7 @@ def main() -> None:
                     "run_once": False,
                     "status_store": status_store,
                     "check_now_event": check_now_event,
+                    "check_preferences": check_preferences,
                 },
                 name="internet-monitor",
                 daemon=True,
@@ -2553,6 +2702,7 @@ def main() -> None:
                 status_store=status_store,
                 check_now_event=check_now_event,
                 traffic_collector=traffic_collector,
+                check_preferences=check_preferences,
             )
     except KeyboardInterrupt:
         if logger:

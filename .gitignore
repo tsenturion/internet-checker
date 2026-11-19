@@ -26,6 +26,8 @@ pip-wheel-metadata/
 logs/
 *.log
 config.json
+check-settings.json
+check-settings.tmp
 notification-state.json
 notification-state.tmp
 network-metrics.json
