@@ -64,6 +64,38 @@ class MonitorStatesTest(unittest.TestCase):
         self.assertTrue(result[0])
         self.assertEqual(country.call_args.kwargs["timeout_seconds"], 0.02)
 
+    def test_outage_requires_minimum_time_even_with_rapid_failed_cycles(self):
+        for initial_online in (True, None):
+            with self.subTest(initial_online=initial_online):
+                debouncer = main.StateDebouncer(1, 2, 1, 1, 1, online_fail_min_seconds=30)
+                with mock.patch("main.time.monotonic") as clock:
+                    if initial_online:
+                        debouncer.update(True, None, None, {})
+                    for moment in (0, 5, 20, 29.9):
+                        clock.return_value = moment
+                        debouncer.update(False, None, None, {})
+                        self.assertEqual(debouncer.has_stable_online, bool(initial_online))
+                        if initial_online:
+                            self.assertTrue(debouncer.stable_online)
+                    clock.return_value = 30
+                    debouncer.update(False, None, None, {})
+                    self.assertTrue(debouncer.has_stable_online)
+                    self.assertFalse(debouncer.stable_online)
+                    self.assertEqual(events_for(None, make_state(False))[0].message, "Нет интернета")
+                    debouncer.update(True, None, None, {})
+                    self.assertTrue(debouncer.stable_online)
+
+    def test_success_before_deadline_restarts_outage_timer(self):
+        debouncer = main.StateDebouncer(1, 2, 1, 1, 1, online_fail_min_seconds=30)
+        with mock.patch("main.time.monotonic") as clock:
+            for moment, online in ((0, True), (5, False), (15, False), (20, True), (25, False), (35, False), (54, False)):
+                clock.return_value = moment
+                debouncer.update(online, None, None, {})
+                self.assertTrue(debouncer.stable_online)
+            clock.return_value = 55
+            debouncer.update(False, None, None, {})
+            self.assertFalse(debouncer.stable_online)
+
     def test_cycle_budget_includes_all_connectivity_attempts(self):
         config = copy.deepcopy(main.DEFAULT_CONFIG)
         config["connectivity_attempts"] = 3
@@ -77,14 +109,34 @@ class MonitorStatesTest(unittest.TestCase):
         self.assertEqual(connectivity.call_args.kwargs["attempts"], 3)
         self.assertAlmostEqual(wait.call_args.kwargs["timeout"], 31.2)
 
-    def test_general_internet_is_independent_of_country_and_services(self):
+    def test_only_fresh_builtin_checks_can_override_failed_connectivity_probes(self):
         config = copy.deepcopy(main.DEFAULT_CONFIG)
-        with mock.patch("main.check_connectivity", return_value=False), \
-                mock.patch("main.fetch_country", return_value=("Italy", "IT", "test")), \
-                mock.patch("main.check_services", return_value={"chatgpt": True, "openai-api": True}):
-            result = main.run_cycle_checks(config, logging.getLogger("test"), [])
-        self.assertFalse(result[0])
-        self.assertTrue(result[4]["openai-api"])
+        config["service_checks"].append({"id": "local", "name": "Локальный сервис",
+                                         "probe_urls": [{"url": "http://localhost/", "method": "GET"}]})
+        for source, services, expected in (
+                ("https://ipapi.co/json/", {}, True),
+                ("http://ip-api.com/json/?fields=status,country,countryCode,query", {}, False),
+                ("https://example.invalid/", {"local": True}, False),
+                (None, {"chatgpt": True}, True),
+                (None, {"openai-api": False}, False),
+                (None, {}, False)):
+            with self.subTest(source=source, services=services):
+                country = ("Italy", "IT", source) if source else (None, None, None)
+                with mock.patch("main.check_connectivity", return_value=False), \
+                        mock.patch("main.fetch_country", return_value=country), \
+                        mock.patch("main.check_services", return_value=services):
+                    result = main.run_cycle_checks(config, logging.getLogger("test"), [])
+                self.assertIs(result[0], expected)
+                self.assertEqual(result[4], services)
+
+    def test_disabled_internet_check_is_not_inferred_from_other_checks(self):
+        config = copy.deepcopy(main.DEFAULT_CONFIG)
+        with mock.patch("main.check_connectivity") as connectivity, \
+                mock.patch("main.fetch_country", return_value=("Italy", "IT", "https://ipapi.co/json/")), \
+                mock.patch("main.check_services", return_value={"chatgpt": True}):
+            result = main.run_cycle_checks(config, logging.getLogger("test"), [], check_internet=False)
+        connectivity.assert_not_called()
+        self.assertIsNone(result[0])
         lines = main.tray_status_lines(main.StatusSnapshot(make_state(False), False, None, None))
         self.assertEqual(lines[0], "Нет интернета")
 

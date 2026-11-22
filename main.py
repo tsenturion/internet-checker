@@ -70,6 +70,7 @@ DEFAULT_CONFIG = {
     "service_request_timeout_seconds": 8.0,
     "connectivity_success_confirmations": 1,
     "connectivity_fail_confirmations": 2,
+    "connectivity_fail_min_seconds": 30.0,
     "country_confirmations": 1,
     "service_success_confirmations": 1,
     "service_fail_confirmations": 3,
@@ -348,9 +349,12 @@ class StateDebouncer:
         service_success: int,
         service_fail: int,
         service_fail_overrides: Optional[dict[str, int]] = None,
+        *,
+        online_fail_min_seconds: float = 0.0,
     ):
         self._online_success_required = max(1, int(online_success))
         self._online_fail_required = max(1, int(online_fail))
+        self._online_fail_min_seconds = online_fail_min_seconds
         self._country_required = max(1, int(country_confirmations))
         self._service_success_required = max(1, int(service_success))
         self._service_fail_required = max(1, int(service_fail))
@@ -362,6 +366,7 @@ class StateDebouncer:
 
         self._online_success_streak = 0
         self._online_fail_streak = 0
+        self._online_fail_since: Optional[float] = None
         self._service_states: dict[str, ServiceDebounceState] = {}
 
         self._country_candidate_key: Optional[str] = None
@@ -380,6 +385,12 @@ class StateDebouncer:
     @property
     def connectivity_failure_progress(self) -> tuple[int, int]:
         return self._online_fail_streak, self._online_fail_required
+
+    @property
+    def connectivity_failure_seconds(self) -> float:
+        if self._online_fail_since is None:
+            return 0.0
+        return time.monotonic() - self._online_fail_since
 
     @property
     def stable_country_name(self) -> Optional[str]:
@@ -461,17 +472,26 @@ class StateDebouncer:
             self._stable_online = None
             self._online_success_streak = 0
             self._online_fail_streak = 0
+            self._online_fail_since = None
         elif raw_online:
             self._online_success_streak += 1
             self._online_fail_streak = 0
+            self._online_fail_since = None
         else:
             self._online_fail_streak += 1
             self._online_success_streak = 0
+            if self._online_fail_since is None:
+                self._online_fail_since = time.monotonic()
 
+        outage_confirmed = (
+            raw_online is False
+            and self._online_fail_streak >= self._online_fail_required
+            and self.connectivity_failure_seconds >= self._online_fail_min_seconds
+        )
         if raw_online is not None and self._stable_online is None:
             if raw_online and self._online_success_streak >= self._online_success_required:
                 self._stable_online = True
-            elif not raw_online and self._online_fail_streak >= self._online_fail_required:
+            elif outage_confirmed:
                 self._stable_online = False
             else:
                 return DebounceUpdate(
@@ -479,7 +499,7 @@ class StateDebouncer:
                     country_changed=False,
                     services_changed=services_changed,
                 )
-        elif self._stable_online and raw_online is False and self._online_fail_streak >= self._online_fail_required:
+        elif self._stable_online and outage_confirmed:
             self._stable_online = False
             online_changed = True
         elif self._stable_online is False and raw_online and self._online_success_streak >= self._online_success_required:
@@ -906,6 +926,7 @@ def load_config(path: Path) -> dict:
     config["connectivity_attempts"] = max(1, int(config.get("connectivity_attempts", 1)))
     config["connectivity_success_confirmations"] = max(1, int(config["connectivity_success_confirmations"]))
     config["connectivity_fail_confirmations"] = max(1, int(config["connectivity_fail_confirmations"]))
+    config["connectivity_fail_min_seconds"] = max(0.0, float(config["connectivity_fail_min_seconds"]))
     config["country_confirmations"] = max(1, int(config["country_confirmations"]))
     service_success_confirmations = config["service_success_confirmations"]
     if "service_success_confirmations" not in custom_config and "chatgpt_success_confirmations" in custom_config:
@@ -2283,7 +2304,21 @@ def run_cycle_checks(
 
     raw_country_name, raw_country_code, country_source = results["country"]
     raw_online = bool(results["online"]) if check_internet else None
-    return raw_online, raw_country_name, raw_country_code, country_source, dict(results["services"])
+    service_results = dict(results["services"])
+    if raw_online is False:
+        evidence = []
+        if (country_source in DEFAULT_CONFIG["country_lookup_urls"] and country_source.startswith("https://")
+                and (raw_country_name or raw_country_code)):
+            evidence.append(urlparse(country_source).hostname)
+        builtin_checks = {service["id"]: service["probe_urls"] for service in DEFAULT_CONFIG["service_checks"]}
+        for service in service_checks:
+            if (service_results.get(service["id"]) is True
+                    and service["probe_urls"] == builtin_checks.get(service["id"])):
+                evidence.append(service["name"])
+        if evidence:
+            logger.info("Контрольные адреса не ответили, но внешняя связь подтверждена: %s.", ", ".join(evidence))
+            raw_online = True
+    return raw_online, raw_country_name, raw_country_code, country_source, service_results
 
 
 def sync_office_country(country_code: Optional[str], logger: logging.Logger) -> str:
@@ -2344,6 +2379,7 @@ def run_monitor_loop(
     debouncer = StateDebouncer(
         online_success=int(config["connectivity_success_confirmations"]),
         online_fail=int(config["connectivity_fail_confirmations"]),
+        online_fail_min_seconds=float(config["connectivity_fail_min_seconds"]),
         country_confirmations=int(config["country_confirmations"]),
         service_success=int(config["service_success_confirmations"]),
         service_fail=int(config["service_fail_confirmations"]),
@@ -2429,7 +2465,8 @@ def run_monitor_loop(
             )
             if raw_online is False:
                 failures, required = debouncer.connectivity_failure_progress
-                logger.info("Сбой проверки интернета: %d/%d; %s", failures, required,
+                logger.info("Сбой проверки интернета: %d/%d, %.1f из %.1f с; %s", failures, required,
+                            debouncer.connectivity_failure_seconds, config["connectivity_fail_min_seconds"],
                             "нет интернета" if debouncer.has_stable_online and not debouncer.stable_online
                             else "ожидается подтверждение сбоя")
             if raw_online is not None and not debouncer.has_stable_online:
