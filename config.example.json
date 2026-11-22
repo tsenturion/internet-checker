@@ -5,7 +5,7 @@
   "service_request_timeout_seconds": 8.0,
   "connectivity_success_confirmations": 1,
   "connectivity_fail_confirmations": 2,
-  "connectivity_fail_min_seconds": 30.0,
+  "connectivity_fail_min_seconds": 25.0,
   "country_confirmations": 1,
   "service_success_confirmations": 1,
   "service_fail_confirmations": 3,
