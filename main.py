@@ -21,7 +21,7 @@ from datetime import datetime
 from html.parser import HTMLParser
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import unquote, urlparse
 from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
@@ -1228,6 +1228,9 @@ class NetologyCheckPolicy:
     def paused(self) -> bool:
         return self._paused.is_set()
 
+    def schedule_now(self) -> None:
+        self.next_check_at = 0.0
+
     def select_services(self, services: list[dict], manual_check: bool = False) -> list[dict]:
         now = self.clock()
         due = not self.paused and (manual_check or now >= self.next_check_at)
@@ -1857,19 +1860,33 @@ def open_path(path: Path) -> None:
     raise RuntimeError("No supported file opener found.")
 
 
-def tray_all_online(snapshot: StatusSnapshot) -> bool:
+TrayIconState = Literal["online", "offline", "pending"]
+
+
+def tray_icon_state(snapshot: StatusSnapshot) -> TrayIconState:
     state = snapshot.state
-    return bool(state is not None and not snapshot.last_error and state.online is not False
-                and all(service.online is True for service in state.service_statuses))
+    if snapshot.last_error:
+        return "offline"
+    if state is None:
+        return "pending"
+    if state.online is False or any(service.online is False for service in state.service_statuses):
+        return "offline"
+    if any(service.online is None for service in state.service_statuses):
+        return "pending"
+    return "online"
 
 
-def create_tray_image(online: bool) -> Image.Image:
+def create_tray_image(icon_state: TrayIconState) -> Image.Image:
     image = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    if online:
+    if icon_state == "online":
         draw.ellipse((12, 12, 244, 244), fill=(0, 100, 45, 255))
         draw.polygon(((56, 128), (80, 104), (112, 137), (181, 65), (206, 89), (111, 186)),
                      fill=(255, 255, 255, 255))
+    elif icon_state == "pending":
+        draw.ellipse((12, 12, 244, 244), fill=(75, 85, 99, 255))
+        for x in (68, 128, 188):
+            draw.ellipse((x - 15, 113, x + 15, 143), fill=(255, 255, 255, 255))
     else:
         color = (239, 68, 68, 255)
         draw.line((60, 60, 196, 196), fill=color, width=42)
@@ -2189,6 +2206,9 @@ def tray_status_lines(snapshot: StatusSnapshot) -> list[str]:
     lines = [connection_status_text(state)]
     lines.extend(service_status_text(service) for service in group_service_statuses(state.service_statuses)
                  if service.online is False)
+    pending = [service.name for service in state.service_statuses if service.online is None]
+    if pending:
+        lines.append("Ожидается результат: " + ", ".join(pending))
     if state.office_country_warning:
         lines.append(state.office_country_warning)
     lines.append(f"Обновлено: {checked_at}")
@@ -2398,6 +2418,7 @@ def run_monitor_loop(
     previous_state: Optional[NetworkState] = None
     last_country_source: Optional[str] = None
     office_country_warning = ""
+    previous_disabled: frozenset[str] = frozenset()
 
     logger.info("Internet checker started.")
     if bool(config.get("show_app_started_notification", True)):
@@ -2431,11 +2452,16 @@ def run_monitor_loop(
                 country_urls = [last_country_source] + [url for url in country_urls if url != last_country_source]
 
             enabled_services = []
+            newly_enabled = previous_disabled - disabled
             for service in config["service_checks"]:
-                if f"service:{service['id']}" in disabled:
+                check_id = f"service:{service['id']}"
+                if check_id in disabled:
                     debouncer.reset_service(service["id"])
                 else:
                     enabled_services.append(service)
+                    if check_id in newly_enabled and is_netology_service(service):
+                        netology_policy.schedule_now()
+            previous_disabled = disabled
 
             raw_online, raw_country_name, raw_country_code, country_source, raw_service_statuses = run_cycle_checks(
                 config={**config, "service_checks": enabled_services},
@@ -2574,11 +2600,16 @@ def run_with_tray(
         check_preferences=check_preferences,
     )
     initial_snapshot = status_store.snapshot()
-    initial_online = tray_all_online(initial_snapshot)
-    tray_images = {online: create_tray_image(online) for online in (False, True)}
+    initial_icon_state = tray_icon_state(initial_snapshot)
+    tray_labels: dict[TrayIconState, str] = {
+        "online": "зелёная галочка",
+        "offline": "красный крестик",
+        "pending": "ожидание результата",
+    }
+    tray_images = {state: create_tray_image(state) for state in tray_labels}
     tray_icon = ClickMenuIcon(
         name="internet-checker",
-        icon=tray_images[initial_online],
+        icon=tray_images[initial_icon_state],
         title=tray_tooltip(str(config["tray_icon_tooltip"]), initial_snapshot),
         menu=None,
         popup_controller=popup_controller,
@@ -2593,16 +2624,16 @@ def run_with_tray(
                 pass
 
     def refresh_tray_status() -> None:
-        previous_online = initial_online
+        previous_icon_state = initial_icon_state
         while not stop_event.is_set():
             try:
                 snapshot = status_store.snapshot()
-                online = tray_all_online(snapshot)
+                icon_state = tray_icon_state(snapshot)
                 tray_icon.title = tray_tooltip(str(config["tray_icon_tooltip"]), snapshot)
-                if online != previous_online:
-                    tray_icon.icon = tray_images[online]
-                    previous_online = online
-                    logger.info("Иконка трея: %s", "зелёная галочка" if online else "красный крестик")
+                if icon_state != previous_icon_state:
+                    tray_icon.icon = tray_images[icon_state]
+                    previous_icon_state = icon_state
+                    logger.info("Иконка трея: %s", tray_labels[icon_state])
             except Exception:
                 pass
             stop_event.wait(1)

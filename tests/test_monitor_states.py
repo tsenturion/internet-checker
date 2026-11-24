@@ -25,6 +25,18 @@ def events_for(previous, current):
 
 
 class MonitorStatesTest(unittest.TestCase):
+    def test_tray_distinguishes_pending_service_from_confirmed_failure(self):
+        for result, expected in ((None, "pending"), (False, "offline"), (True, "online")):
+            with self.subTest(result=result):
+                state = make_state(services=[main.ServiceStatus("netology", "Netology", result)])
+                snapshot = main.StatusSnapshot(state, False, None, None)
+                self.assertEqual(main.tray_icon_state(snapshot), expected)
+                self.assertEqual("Ожидается результат: Netology" in main.tray_status_lines(snapshot), result is None)
+
+        self.assertEqual(main.tray_icon_state(main.StatusSnapshot(None, True, None, None)), "pending")
+        self.assertEqual(main.tray_icon_state(main.StatusSnapshot(make_state(False), False, None, None)), "offline")
+        self.assertEqual(main.tray_icon_state(main.StatusSnapshot(make_state(), False, None, "error")), "offline")
+
     def test_internet_outage_requires_consecutive_failures(self):
         config = main.DEFAULT_CONFIG
         debouncer = main.StateDebouncer(config["connectivity_success_confirmations"],
